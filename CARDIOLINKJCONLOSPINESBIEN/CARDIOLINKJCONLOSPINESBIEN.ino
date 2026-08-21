@@ -34,8 +34,8 @@ WiFiServer servidorTCP(PUERTO_TCP);
 // LCD
 // ============================================================
 
-#define LCD_SDA 22
-#define LCD_SCL 21
+#define LCD_SDA 21
+#define LCD_SCL 22
 #define LCD_ADDRESS 0x27
 
 hd44780_I2Cexp lcd(LCD_ADDRESS);
@@ -169,6 +169,7 @@ const unsigned long TIMEOUT_RESET_MODEM = 180000;
 unsigned long ultimoReencendido = 0;
 
 const unsigned long COOLDOWN_REENCENDIDO = 30000;
+
 
 // ============================================================
 // ESTADO
