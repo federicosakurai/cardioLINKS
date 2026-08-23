@@ -1,0 +1,4509 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <hd44780.h>
+#include <hd44780ioClass/hd44780_I2Cexp.h>
+
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
+
+#include <SPI.h>
+#include <Ethernet.h>
+#include <PubSubClient.h>
+
+// ============================================================
+// ETHERNET - W5500 (reemplaza al WiFi AP local)
+// ============================================================
+
+#define ETH_MOSI 23
+#define ETH_MISO 19
+#define ETH_SCLK 18
+#define ETH_CS   5
+#define ETH_RST  25
+
+byte macAddress[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
+
+// IP fija del gateway (antes era la IP del AP: 192.168.4.1)
+IPAddress ipGateway(192, 168, 4, 1);
+IPAddress dnsGateway(192, 168, 4, 1);
+IPAddress gatewayRed(192, 168, 4, 1);
+IPAddress subnetRed(255, 255, 255, 0);
+
+const uint16_t PUERTO_TCP = 2575;
+
+EthernetServer servidorTCP(PUERTO_TCP);
+
+bool ethernetConectado = false;
+
+// ============================================================
+// MLLP
+// ============================================================
+
+#define MLLP_VT 0x0B
+#define MLLP_FS 0x1C
+#define MLLP_CR 0x0D
+
+// ============================================================
+// LCD
+// ============================================================
+
+#define LCD_SDA 21
+#define LCD_SCL 22
+#define LCD_ADDRESS 0x27
+
+hd44780_I2Cexp lcd(LCD_ADDRESS);
+
+// ============================================================
+// MODEM A7670SA
+// ============================================================
+
+#define TINY_GSM_MODEM_A7670
+#define TINY_GSM_RX_BUFFER 1024
+
+#define MODEM_BAUDRATE     115200
+#define MODEM_DTR_PIN      25
+#define MODEM_TX_PIN       26
+#define MODEM_RX_PIN       27
+
+#define BOARD_PWRKEY_PIN   4
+#define BOARD_POWERON_PIN  12
+
+#define MODEM_RING_PIN     33
+#define MODEM_RESET_PIN    5
+#define MODEM_RESET_LEVEL  HIGH
+
+#define SerialAT Serial1
+
+#define SIM_PIN ""
+
+const char* NETWORK_APN = "internet.ctimovil.com.ar";
+const char* GPRS_USER   = "";
+const char* GPRS_PASS   = "";
+
+#include <TinyGsmClient.h>
+
+#ifdef DUMP_AT_COMMANDS
+
+#include <StreamDebugger.h>
+
+StreamDebugger debugger(SerialAT, Serial);
+TinyGsm modem(debugger);
+
+#else
+
+TinyGsm modem(SerialAT);
+
+#endif
+
+TinyGsmClient gsmClient(modem);
+
+// ============================================================
+// MUTEX MODEM
+// ============================================================
+
+SemaphoreHandle_t modemMutex;
+
+// ============================================================
+// FIREBASE
+// ============================================================
+
+const char* FIREBASE_HOST =
+  "firestore.googleapis.com";
+
+const char* FIREBASE_PATH_BASE =
+  "/v1/projects/cardiolink-f186f/databases/(default)/documents/ecgs";
+
+// ============================================================
+// PSRAM
+// ============================================================
+
+#define BUFFER_SIZE (1280UL * 1024UL)
+
+#define MAX_ECG_PENDIENTES 2
+
+#define ECG_SLOT_SIZE (1200UL * 1024UL)
+
+char* hl7Buffer = nullptr;
+
+// ============================================================
+// ECG
+// ============================================================
+
+struct ECGPendiente {
+
+  bool ocupado;
+  bool enviado;
+
+  char paciente[128];
+  char ecgId[64];
+  char fecha[64];
+
+  char* pdfBase64;
+};
+
+ECGPendiente colaECG[MAX_ECG_PENDIENTES];
+
+int totalPendientes = 0;
+
+// ============================================================
+// LCD QUEUE
+// ============================================================
+
+struct MensajeLCD {
+
+  char l1[21];
+  char l2[21];
+  char l3[21];
+  char l4[21];
+
+  int numLineas;
+};
+
+QueueHandle_t colaLCD;
+
+TaskHandle_t taskLCDHandle;
+
+// ============================================================
+// RED 4G
+// ============================================================
+
+bool hayInternet = false;
+bool estadoRedAnterior = false;
+
+unsigned long ultimoIntentoRed = 0;
+
+const unsigned long INTERVALO_RECONEXION_RED = 5000;
+
+unsigned long inicioSinRed = 0;
+bool contandoSinRed = false;
+
+const unsigned long TIMEOUT_RESET_MODEM = 180000;
+
+unsigned long ultimoReencendido = 0;
+
+const unsigned long COOLDOWN_REENCENDIDO = 30000;
+
+
+// ============================================================
+// ESTADO
+// ============================================================
+
+bool huboAlMenosUnECG = false;
+
+// ============================================================
+// DELIMITADORES HL7
+// ============================================================
+
+struct DelimitadoresHL7 {
+
+  char campo;
+  char componente;
+  char repeticion;
+  char escape;
+  char subcomponente;
+};
+
+DelimitadoresHL7 delims = {
+  '|',
+  '^',
+  '~',
+  '\\',
+  '&'
+};
+
+// ============================================================
+// PROTOTIPOS
+// ============================================================
+
+void inicializarEthernet();
+
+void inicializarModem();
+
+bool conectarRed(bool mostrarEnLCD);
+
+bool verificarConexion();
+
+bool modemVivo();
+
+void gestionarRed();
+
+bool inicializarPSRAM();
+
+bool inicializarColaECG();
+
+bool recibirHL7PorTCP();
+
+void enviarACK(EthernetClient &cliente);
+
+void procesarTrama();
+
+bool leerDelimitadores(const char* hl7);
+
+String extraerComponente(
+  const String& campo,
+  int numComponente
+);
+
+String extraerCampoDeSegmento(
+  const char* segmento,
+  int numCampo
+);
+
+String extraerCampoHL7(
+  const char* nombreSegmento,
+  int numCampo,
+  int numComponente
+);
+
+// ============================================================
+// NUEVAS FUNCIONES PARA BASE64
+// ============================================================
+
+bool copiarComponenteDirecto(
+  const char* segmento,
+  int numCampo,
+  int numComponente,
+  char* destino,
+  size_t capacidad,
+  size_t& longitud
+);
+
+bool extraerBase64PDFAlSlot(
+  char* hl7,
+  char* destino,
+  size_t capacidad
+);
+
+bool validarBase64(const char* base64);
+
+bool esCaracterBase64(char c);
+
+// ============================================================
+// ECG
+// ============================================================
+
+void liberarSlotECG(int index);
+
+void procesarColaPendientes();
+
+void mostrarEstadoListo();
+
+void tareaLCD(void* parametro);
+
+int buscarSlotLibre();
+
+// ============================================================
+// JSON / FIREBASE
+// ============================================================
+
+size_t calcularJSONSize(
+  ECGPendiente& ecg
+);
+
+size_t copiarJSONEscapado(
+  char* destino,
+  size_t capacidad,
+  const char* origen
+);
+
+bool construirJSONEnPSRAM(
+  ECGPendiente& ecg,
+  char* json,
+  size_t capacidad,
+  size_t& longitud
+);
+
+bool enviarECGAFirebase(
+  int index
+);
+
+// ============================================================
+// LCD
+// ============================================================
+
+void limpiarLineaLCD(int linea) {
+
+  lcd.setCursor(0, linea);
+  lcd.print("                    ");
+}
+
+// ============================================================
+
+void escribirLineaLCD(
+  int linea,
+  const char* texto
+) {
+
+  limpiarLineaLCD(linea);
+
+  lcd.setCursor(0, linea);
+
+  lcd.print(texto);
+}
+
+// ============================================================
+// MOSTRAR LCD
+// ============================================================
+
+void mostrarLCD(String linea1) {
+
+  MensajeLCD msg;
+
+  strncpy(
+    msg.l1,
+    linea1.c_str(),
+    sizeof(msg.l1) - 1
+  );
+
+  msg.l1[sizeof(msg.l1) - 1] = '\0';
+
+  msg.l2[0] = '\0';
+  msg.l3[0] = '\0';
+  msg.l4[0] = '\0';
+
+  msg.numLineas = 1;
+
+  xQueueSend(
+    colaLCD,
+    &msg,
+    0
+  );
+}
+
+// ============================================================
+
+void mostrarLCD(
+  String linea1,
+  String linea2
+) {
+
+  MensajeLCD msg;
+
+  strncpy(
+    msg.l1,
+    linea1.c_str(),
+    sizeof(msg.l1) - 1
+  );
+
+  msg.l1[sizeof(msg.l1) - 1] = '\0';
+
+  strncpy(
+    msg.l2,
+    linea2.c_str(),
+    sizeof(msg.l2) - 1
+  );
+
+  msg.l2[sizeof(msg.l2) - 1] = '\0';
+
+  msg.l3[0] = '\0';
+  msg.l4[0] = '\0';
+
+  msg.numLineas = 2;
+
+  xQueueSend(
+    colaLCD,
+    &msg,
+    0
+  );
+}
+
+// ============================================================
+
+void mostrarLCD(
+  String linea1,
+  String linea2,
+  String linea3
+) {
+
+  MensajeLCD msg;
+
+  strncpy(
+    msg.l1,
+    linea1.c_str(),
+    sizeof(msg.l1) - 1
+  );
+
+  msg.l1[sizeof(msg.l1) - 1] = '\0';
+
+  strncpy(
+    msg.l2,
+    linea2.c_str(),
+    sizeof(msg.l2) - 1
+  );
+
+  msg.l2[sizeof(msg.l2) - 1] = '\0';
+
+  strncpy(
+    msg.l3,
+    linea3.c_str(),
+    sizeof(msg.l3) - 1
+  );
+
+  msg.l3[sizeof(msg.l3) - 1] = '\0';
+
+  msg.l4[0] = '\0';
+
+  msg.numLineas = 3;
+
+  xQueueSend(
+    colaLCD,
+    &msg,
+    0
+  );
+}
+
+// ============================================================
+
+void mostrarLCD(
+  String linea1,
+  String linea2,
+  String linea3,
+  String linea4
+) {
+
+  MensajeLCD msg;
+
+  strncpy(
+    msg.l1,
+    linea1.c_str(),
+    sizeof(msg.l1) - 1
+  );
+
+  msg.l1[sizeof(msg.l1) - 1] = '\0';
+
+  strncpy(
+    msg.l2,
+    linea2.c_str(),
+    sizeof(msg.l2) - 1
+  );
+
+  msg.l2[sizeof(msg.l2) - 1] = '\0';
+
+  strncpy(
+    msg.l3,
+    linea3.c_str(),
+    sizeof(msg.l3) - 1
+  );
+
+  msg.l3[sizeof(msg.l3) - 1] = '\0';
+
+  strncpy(
+    msg.l4,
+    linea4.c_str(),
+    sizeof(msg.l4) - 1
+  );
+
+  msg.l4[sizeof(msg.l4) - 1] = '\0';
+
+  msg.numLineas = 4;
+
+  xQueueSend(
+    colaLCD,
+    &msg,
+    0
+  );
+}
+
+// ============================================================
+// ESTADO LISTO
+// ============================================================
+
+void mostrarEstadoListo() {
+
+  String textoEspera =
+    huboAlMenosUnECG
+      ? "Esperando otro ECG"
+      : "Esperando ECG";
+
+  if (hayInternet) {
+
+    mostrarLCD(
+      "cardioLink",
+      "SISTEMA LISTO",
+      "4G: CONECTADO",
+      textoEspera
+    );
+
+  } else {
+
+    mostrarLCD(
+      "cardioLink",
+      "SIN SENAL 4G",
+      "Datos en PSRAM",
+      textoEspera
+    );
+  }
+}
+
+// ============================================================
+// TAREA LCD
+// ============================================================
+
+void tareaLCD(void* parametro) {
+
+  MensajeLCD msg;
+
+  for (;;) {
+
+    if (
+      xQueueReceive(
+        colaLCD,
+        &msg,
+        portMAX_DELAY
+      ) == pdTRUE
+    ) {
+
+      lcd.clear();
+
+      escribirLineaLCD(
+        0,
+        msg.l1
+      );
+
+      if (msg.numLineas >= 2) {
+
+        escribirLineaLCD(
+          1,
+          msg.l2
+        );
+      }
+
+      if (msg.numLineas >= 3) {
+
+        escribirLineaLCD(
+          2,
+          msg.l3
+        );
+      }
+
+      if (msg.numLineas >= 4) {
+
+        escribirLineaLCD(
+          3,
+          msg.l4
+        );
+      }
+    }
+  }
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  delay(2000);
+
+  Serial.println();
+
+  Serial.println(
+    "========================================"
+  );
+
+  Serial.println(
+    "       cardioLink - MULTI ECG"
+  );
+
+  Serial.println(
+    "       4G + Ethernet W5500"
+  );
+
+  Serial.println(
+    " TTGO T-A7670SA ESP32-WROVER"
+  );
+
+  Serial.println(
+    " Recepcion HL7 v2.5/2.6"
+  );
+
+  Serial.println(
+    " MLLP/TCP"
+  );
+
+  Serial.println(
+    "========================================"
+  );
+
+  // ==========================================================
+  // LCD
+  // ==========================================================
+
+  Wire.begin(
+    LCD_SDA,
+    LCD_SCL
+  );
+
+  int status =
+    lcd.begin(
+      20,
+      4
+    );
+
+  if (status) {
+
+    Serial.println(
+      "ERROR: Fallo al iniciar LCD"
+    );
+
+    hd44780::fatalError(status);
+  }
+
+  lcd.backlight();
+
+  Serial.println(
+    "LCD I2C iniciado"
+  );
+
+  // ==========================================================
+  // MUTEX
+  // ==========================================================
+
+  modemMutex =
+    xSemaphoreCreateMutex();
+
+  if (modemMutex == nullptr) {
+
+    Serial.println(
+      "ERROR: No se pudo crear mutex"
+    );
+
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  // ==========================================================
+  // COLA LCD
+  // ==========================================================
+
+  colaLCD =
+    xQueueCreate(
+      10,
+      sizeof(MensajeLCD)
+    );
+
+  if (colaLCD == nullptr) {
+
+    Serial.println(
+      "ERROR: No se pudo crear cola LCD"
+    );
+
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  xTaskCreatePinnedToCore(
+    tareaLCD,
+    "TareaLCD",
+    4096,
+    NULL,
+    1,
+    &taskLCDHandle,
+    0
+  );
+
+  mostrarLCD(
+    "cardioLink",
+    "Iniciando sistema...",
+    "TTGO T-A7670SA"
+  );
+
+  delay(2000);
+
+  // ==========================================================
+  // ETHERNET W5500
+  // ==========================================================
+
+  inicializarEthernet();
+
+  // ==========================================================
+  // PSRAM
+  // ==========================================================
+
+  if (!inicializarPSRAM()) {
+
+    mostrarLCD(
+      "ERROR PSRAM",
+      "Memoria insuficiente",
+      "Sistema detenido"
+    );
+
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  // ==========================================================
+  // SLOTS
+  // ==========================================================
+
+  if (!inicializarColaECG()) {
+
+    mostrarLCD(
+      "ERROR",
+      "PSRAM INSUFICIENTE",
+      "Slots ECG"
+    );
+
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  // ==========================================================
+  // INFORMACION PSRAM
+  // ==========================================================
+
+  Serial.println();
+
+  Serial.println(
+    "========================================"
+  );
+
+  Serial.println(
+    "CONFIGURACION DE MEMORIA"
+  );
+
+  Serial.printf(
+    "PSRAM total: %lu KB\n",
+    (unsigned long)(
+      ESP.getPsramSize() / 1024
+    )
+  );
+
+  Serial.printf(
+    "PSRAM libre: %lu KB\n",
+    (unsigned long)(
+      ESP.getFreePsram() / 1024
+    )
+  );
+
+  Serial.printf(
+    "Buffer HL7: %lu KB\n",
+    (unsigned long)(
+      BUFFER_SIZE / 1024
+    )
+  );
+
+  Serial.printf(
+    "Slots ECG: %d\n",
+    MAX_ECG_PENDIENTES
+  );
+
+  Serial.printf(
+    "Tamano cada slot: %lu KB\n",
+    (unsigned long)(
+      ECG_SLOT_SIZE / 1024
+    )
+  );
+
+  Serial.printf(
+    "PSRAM libre final: %lu KB\n",
+    (unsigned long)(
+      ESP.getFreePsram() / 1024
+    )
+  );
+
+  Serial.println(
+    "========================================"
+  );
+
+  mostrarLCD(
+    "PSRAM OK",
+    "Memoria disponible",
+    "2 ECG x 1.2 MB",
+    "Sistema listo"
+  );
+
+  delay(2500);
+
+  // ==========================================================
+  // MODEM
+  // ==========================================================
+
+  inicializarModem();
+
+  conectarRed(true);
+
+  Serial.println();
+
+  Serial.println(
+    "Sistema listo."
+  );
+
+  Serial.printf(
+    "IP gateway (Ethernet): %s\n",
+    Ethernet.localIP().toString().c_str()
+  );
+
+  Serial.printf(
+    "Puerto MLLP: %d\n",
+    PUERTO_TCP
+  );
+
+  Serial.println();
+
+  mostrarEstadoListo();
+
+  delay(2500);
+}
+
+// ============================================================
+// LOOP
+// ============================================================
+
+void loop() {
+
+  Ethernet.maintain();
+
+  gestionarRed();
+
+  if (hayInternet) {
+
+    procesarColaPendientes();
+  }
+
+  if (recibirHL7PorTCP()) {
+
+    procesarTrama();
+
+    Serial.println();
+
+    Serial.println(
+      "================================="
+    );
+
+    Serial.println(
+      "Listo para recibir otro ECG"
+    );
+
+    Serial.println(
+      "================================="
+    );
+
+    Serial.println();
+
+    mostrarEstadoListo();
+  }
+
+  delay(200);
+}
+
+// ============================================================
+// ETHERNET W5500
+// ============================================================
+
+void inicializarEthernet() {
+
+  Serial.println();
+
+  Serial.println(
+    "Inicializando Ethernet W5500..."
+  );
+
+  mostrarLCD(
+    "cardioLink",
+    "Iniciando Ethernet...",
+    "Espere..."
+  );
+
+  // ----------------------------------------------------------
+  // RESET FISICO DEL MODULO W5500
+  // ----------------------------------------------------------
+
+  pinMode(
+    ETH_RST,
+    OUTPUT
+  );
+
+  digitalWrite(
+    ETH_RST,
+    LOW
+  );
+
+  delay(100);
+
+  digitalWrite(
+    ETH_RST,
+    HIGH
+  );
+
+  delay(200);
+
+  // ----------------------------------------------------------
+  // SPI CON PINES PERSONALIZADOS
+  // ----------------------------------------------------------
+
+  SPI.begin(
+    ETH_SCLK,
+    ETH_MISO,
+    ETH_MOSI,
+    ETH_CS
+  );
+
+  Ethernet.init(
+    ETH_CS
+  );
+
+  // ----------------------------------------------------------
+  // IP FIJA (reemplaza al AP WiFi 192.168.4.1)
+  // ----------------------------------------------------------
+
+  Ethernet.begin(
+    macAddress,
+    ipGateway,
+    dnsGateway,
+    gatewayRed,
+    subnetRed
+  );
+
+  delay(1000);
+
+  if (
+    Ethernet.hardwareStatus() ==
+    EthernetNoHardware
+  ) {
+
+    Serial.println(
+      "ERROR: No se detecto el modulo W5500"
+    );
+
+    mostrarLCD(
+      "ERROR ETHERNET",
+      "W5500 no detectado",
+      "Revisar cableado"
+    );
+
+    ethernetConectado = false;
+
+    delay(3000);
+
+  } else {
+
+    ethernetConectado = true;
+
+    Serial.println(
+      "Modulo W5500 detectado OK"
+    );
+  }
+
+  if (
+    Ethernet.linkStatus() ==
+    LinkOFF
+  ) {
+
+    Serial.println(
+      "ADVERTENCIA: Cable Ethernet desconectado"
+    );
+
+    mostrarLCD(
+      "ETHERNET",
+      "Cable desconectado",
+      "Conecte el cable"
+    );
+
+    delay(2000);
+  }
+
+  servidorTCP.begin();
+
+  Serial.println(
+    "Ethernet iniciado"
+  );
+
+  Serial.print(
+    "IP del gateway: "
+  );
+
+  Serial.println(
+    Ethernet.localIP()
+  );
+
+  Serial.printf(
+    "Servidor TCP escuchando puerto %d\n",
+    PUERTO_TCP
+  );
+
+  mostrarLCD(
+    "ETHERNET OK",
+    "IP:",
+    Ethernet.localIP().toString(),
+    "Puerto 2575"
+  );
+
+  delay(2000);
+}
+
+// ============================================================
+// MODEM
+// ============================================================
+
+void inicializarModem() {
+
+  Serial.println();
+
+  Serial.println(
+    "Inicializando modem 4G..."
+  );
+
+  mostrarLCD(
+    "cardioLink",
+    "Iniciando modem 4G...",
+    "Espere..."
+  );
+
+  SerialAT.begin(
+    MODEM_BAUDRATE,
+    SERIAL_8N1,
+    MODEM_RX_PIN,
+    MODEM_TX_PIN
+  );
+
+  pinMode(
+    BOARD_POWERON_PIN,
+    OUTPUT
+  );
+
+  digitalWrite(
+    BOARD_POWERON_PIN,
+    HIGH
+  );
+
+  delay(1000);
+
+  pinMode(
+    MODEM_RESET_PIN,
+    OUTPUT
+  );
+
+  digitalWrite(
+    MODEM_RESET_PIN,
+    !MODEM_RESET_LEVEL
+  );
+
+  delay(100);
+
+  digitalWrite(
+    MODEM_RESET_PIN,
+    MODEM_RESET_LEVEL
+  );
+
+  delay(100);
+
+  digitalWrite(
+    MODEM_RESET_PIN,
+    !MODEM_RESET_LEVEL
+  );
+
+  pinMode(
+    BOARD_PWRKEY_PIN,
+    OUTPUT
+  );
+
+  digitalWrite(
+    BOARD_PWRKEY_PIN,
+    LOW
+  );
+
+  delay(100);
+
+  digitalWrite(
+    BOARD_PWRKEY_PIN,
+    HIGH
+  );
+
+  delay(1000);
+
+  digitalWrite(
+    BOARD_PWRKEY_PIN,
+    LOW
+  );
+
+  Serial.println(
+    "Esperando respuesta del modem..."
+  );
+
+  delay(8000);
+
+  while (SerialAT.available()) {
+    SerialAT.read();
+  }
+
+  int retry = 0;
+
+  while (!modem.testAT(1000)) {
+
+    Serial.print(".");
+
+    if (retry++ > 10) {
+
+      Serial.println();
+
+      Serial.println(
+        "Reintentando PWRKEY..."
+      );
+
+      digitalWrite(
+        BOARD_PWRKEY_PIN,
+        LOW
+      );
+
+      delay(100);
+
+      digitalWrite(
+        BOARD_PWRKEY_PIN,
+        HIGH
+      );
+
+      delay(1000);
+
+      digitalWrite(
+        BOARD_PWRKEY_PIN,
+        LOW
+      );
+
+      retry = 0;
+
+      delay(5000);
+    }
+  }
+
+  Serial.println();
+
+  Serial.println(
+    "Modem respondiendo OK"
+  );
+
+  Serial.println(
+    "Comprobando SIM..."
+  );
+
+  unsigned long inicioSim =
+    millis();
+
+  SimStatus sim =
+    SIM_ERROR;
+
+  while (
+    millis() - inicioSim < 15000
+  ) {
+
+    sim =
+      modem.getSimStatus();
+
+    if (sim == SIM_READY) {
+
+      Serial.println(
+        "SIM card lista"
+      );
+
+      break;
+    }
+
+    if (sim == SIM_LOCKED) {
+
+      Serial.println(
+        "SIM bloqueada"
+      );
+
+      modem.simUnlock(
+        SIM_PIN
+      );
+    }
+
+    delay(1000);
+  }
+
+  if (sim != SIM_READY) {
+
+    Serial.println(
+      "ADVERTENCIA: SIM no confirmo READY."
+    );
+  }
+
+  modem.setNetworkMode(
+    MODEM_NETWORK_AUTO
+  );
+
+  Serial.printf(
+    "Configurando APN: %s\n",
+    NETWORK_APN
+  );
+
+  modem.sendAT(
+    GF("+CGDCONT=1,\"IP\",\""),
+    NETWORK_APN,
+    "\""
+  );
+
+  if (modem.waitResponse() != 1) {
+
+    Serial.println(
+      "ADVERTENCIA: fallo configurando APN"
+    );
+  }
+}
+
+// ============================================================
+// CONECTAR 4G (CORREGIDO: con mutex + gprsDisconnect previo)
+// ============================================================
+
+bool conectarRed(bool mostrarEnLCD) {
+
+  Serial.println();
+
+  Serial.println(
+    "Registrando en red celular..."
+  );
+
+  if (mostrarEnLCD) {
+
+    mostrarLCD(
+      "CONECTANDO 4G",
+      "Buscando senal...",
+      "Espere..."
+    );
+  }
+
+  xSemaphoreTake(
+    modemMutex,
+    portMAX_DELAY
+  );
+
+  unsigned long inicio =
+    millis();
+
+  RegStatus status =
+    REG_NO_RESULT;
+
+  while (
+    millis() - inicio < 60000
+  ) {
+
+    status =
+      modem.getRegistrationStatus();
+
+    if (
+      status == REG_OK_HOME ||
+      status == REG_OK_ROAMING
+    ) {
+
+      break;
+    }
+
+    if (status == REG_DENIED) {
+
+      Serial.println(
+        "Registro RECHAZADO."
+      );
+
+      break;
+    }
+
+    int16_t sq =
+      modem.getSignalQuality();
+
+    Serial.printf(
+      "Buscando red... Senal: %d\n",
+      sq
+    );
+
+    delay(1500);
+  }
+
+  bool registrado =
+    (
+      status == REG_OK_HOME ||
+      status == REG_OK_ROAMING
+    );
+
+  if (!registrado) {
+
+    hayInternet = false;
+
+    Serial.println(
+      "SIN REGISTRO DE RED"
+    );
+
+    xSemaphoreGive(
+      modemMutex
+    );
+
+    return false;
+  }
+
+  Serial.println(
+    "Registrado en red."
+  );
+
+  // ------------------------------------------------------------
+  // FIX: limpiar cualquier contexto PDP previo antes de reconectar
+  // ------------------------------------------------------------
+
+  modem.gprsDisconnect();
+
+  delay(300);
+
+  bool gprsOK =
+    modem.gprsConnect(
+      NETWORK_APN,
+      GPRS_USER,
+      GPRS_PASS
+    );
+
+  if (!gprsOK) {
+
+    hayInternet = false;
+
+    Serial.println(
+      "ERROR: no se pudo activar datos"
+    );
+
+    xSemaphoreGive(
+      modemMutex
+    );
+
+    return false;
+  }
+
+  hayInternet = true;
+
+  ultimoIntentoRed =
+    millis();
+
+  String ip =
+    modem.getLocalIP();
+
+  xSemaphoreGive(
+    modemMutex
+  );
+
+  Serial.println(
+    "Datos 4G activos"
+  );
+
+  Serial.print(
+    "IP: "
+  );
+
+  Serial.println(ip);
+
+  if (mostrarEnLCD) {
+
+    mostrarLCD(
+      "4G CONECTADO",
+      "IP:",
+      ip,
+      "Conexion OK"
+    );
+
+    delay(2500);
+  }
+
+  return true;
+}
+
+// ============================================================
+// VERIFICAR RED (CORREGIDO: con mutex)
+// ============================================================
+
+bool verificarConexion() {
+
+  xSemaphoreTake(
+    modemMutex,
+    portMAX_DELAY
+  );
+
+  hayInternet =
+    modem.isNetworkConnected() &&
+    modem.isGprsConnected();
+
+  xSemaphoreGive(
+    modemMutex
+  );
+
+  return hayInternet;
+}
+
+// ============================================================
+// MODEM VIVO
+//
+// Verifica si el modem sigue respondiendo a comandos AT.
+// Si el modem se apago fisicamente (brownout, watchdog interno,
+// perdida de alimentacion por picos de corriente al buscar red
+// en zona sin senal), NINGUN comando AT (gprsConnect, etc.)
+// va a funcionar, porque no hay nada del otro lado escuchando.
+//
+// Esto se detecta en campo por las luces rojas de la LilyGO
+// que se apagan y no vuelven a prender solas.
+// ============================================================
+
+bool modemVivo() {
+
+  xSemaphoreTake(
+    modemMutex,
+    portMAX_DELAY
+  );
+
+  bool vivo =
+    modem.testAT(2000);
+
+  xSemaphoreGive(
+    modemMutex
+  );
+
+  return vivo;
+}
+
+// ============================================================
+// GESTIONAR RED (CORREGIDO: gprsDisconnect antes de reintentar
+// + watchdog de reencendido fisico del modem)
+// ============================================================
+
+void gestionarRed() {
+
+  bool estadoActual =
+    verificarConexion();
+
+  if (
+    estadoActual !=
+    estadoRedAnterior
+  ) {
+
+    estadoRedAnterior =
+      estadoActual;
+
+    hayInternet =
+      estadoActual;
+
+    if (estadoActual) {
+
+      contandoSinRed =
+        false;
+
+      Serial.println();
+
+      Serial.println(
+        "================================="
+      );
+
+      Serial.println(
+        "RED 4G RECONECTADA"
+      );
+
+      xSemaphoreTake(
+        modemMutex,
+        portMAX_DELAY
+      );
+
+      String ipActual =
+        modem.getLocalIP();
+
+      xSemaphoreGive(
+        modemMutex
+      );
+
+      Serial.print(
+        "IP: "
+      );
+
+      Serial.println(
+        ipActual
+      );
+
+      Serial.println(
+        "================================="
+      );
+
+      mostrarLCD(
+        "4G RECONECTADO",
+        "Conexion restaurada",
+        "IP:",
+        ipActual
+      );
+
+      delay(2000);
+
+      procesarColaPendientes();
+
+      mostrarEstadoListo();
+
+    } else {
+
+      contandoSinRed =
+        true;
+
+      inicioSinRed =
+        millis();
+
+      Serial.println();
+
+      Serial.println(
+        "================================="
+      );
+
+      Serial.println(
+        "RED 4G PERDIDA"
+      );
+
+      Serial.println(
+        "MODO OFFLINE"
+      );
+
+      Serial.println(
+        "ECG guardado en PSRAM"
+      );
+
+      Serial.println(
+        "================================="
+      );
+
+      mostrarLCD(
+        "SIN SENAL 4G",
+        "Modo offline",
+        "ECG en PSRAM",
+        "Esperando red..."
+      );
+    }
+  }
+
+  hayInternet =
+    estadoActual;
+
+  if (!estadoActual) {
+
+    // ----------------------------------------------------------
+    // PASO 1: VERIFICAR SI EL MODEM SIGUE VIVO (responde AT)
+    //
+    // Si NO responde, no tiene sentido reintentar gprsConnect.
+    // Hay que repetir la secuencia completa de encendido fisico
+    // (BOARD_POWERON_PIN + PWRKEY), igual que en el setup().
+    // ----------------------------------------------------------
+
+    if (!modemVivo()) {
+
+      unsigned long ahoraCooldown =
+        millis();
+
+      // ----------------------------------------------------
+      // COOLDOWN: no reintentar el reencendido fisico antes
+      // de que pase COOLDOWN_REENCENDIDO desde el ultimo intento.
+      //
+      // Sin esto, si el modem tarda en bootear despues de
+      // inicializarModem(), el loop (cada ~200ms) lo va a
+      // volver a llamar antes de que termine de arrancar,
+      // entrando en un ciclo de reinicios sin darle tiempo
+      // real de encender.
+      // ----------------------------------------------------
+
+      if (
+        ahoraCooldown - ultimoReencendido <
+        COOLDOWN_REENCENDIDO
+      ) {
+
+        return;
+      }
+
+      ultimoReencendido =
+        ahoraCooldown;
+
+      Serial.println();
+
+      Serial.println(
+        "========================================"
+      );
+
+      Serial.println(
+        "MODEM NO RESPONDE (posible apagado fisico)"
+      );
+
+      Serial.println(
+        "REENCENDIENDO MODEM COMPLETO..."
+      );
+
+      Serial.println(
+        "========================================"
+      );
+
+      mostrarLCD(
+        "MODEM APAGADO",
+        "Reencendiendo...",
+        "Espere...",
+        ""
+      );
+
+      inicializarModem();
+
+      conectarRed(false);
+
+      ultimoIntentoRed =
+        millis();
+
+      inicioSinRed =
+        millis();
+
+      return;
+    }
+
+    // ----------------------------------------------------------
+    // PASO 2: WATCHDOG POR TIEMPO
+    //
+    // El modem responde AT pero lleva demasiado tiempo sin
+    // recuperar la red (contexto GPRS zombie que ni el
+    // gprsDisconnect logra destrabar). Forzar reinicio completo.
+    // ----------------------------------------------------------
+
+    if (
+      contandoSinRed &&
+      (millis() - inicioSinRed >= TIMEOUT_RESET_MODEM)
+    ) {
+
+      Serial.println();
+
+      Serial.println(
+        "========================================"
+      );
+
+      Serial.println(
+        "SIN RED PROLONGADO"
+      );
+
+      Serial.println(
+        "REINICIANDO MODEM COMPLETO..."
+      );
+
+      Serial.println(
+        "========================================"
+      );
+
+      mostrarLCD(
+        "SIN SENAL 4G",
+        "Reiniciando modem",
+        "Espere...",
+        ""
+      );
+
+      inicializarModem();
+
+      conectarRed(false);
+
+      inicioSinRed =
+        millis();
+
+      ultimoIntentoRed =
+        millis();
+
+      return;
+    }
+
+    // ----------------------------------------------------------
+    // PASO 3: REINTENTO NORMAL (modem vivo, solo sin registro)
+    // ----------------------------------------------------------
+
+    unsigned long ahora =
+      millis();
+
+    if (
+      ahora - ultimoIntentoRed >=
+      INTERVALO_RECONEXION_RED
+    ) {
+
+      ultimoIntentoRed =
+        ahora;
+
+      Serial.println(
+        "Intentando reconectar 4G..."
+      );
+
+      xSemaphoreTake(
+        modemMutex,
+        portMAX_DELAY
+      );
+
+      modem.gprsDisconnect();
+
+      xSemaphoreGive(
+        modemMutex
+      );
+
+      delay(500);
+
+      conectarRed(false);
+    }
+  }
+}
+
+// ============================================================
+// PSRAM
+// ============================================================
+
+bool inicializarPSRAM() {
+
+  Serial.println();
+
+  Serial.println(
+    "Comprobando PSRAM..."
+  );
+
+  if (!psramFound()) {
+
+    Serial.println(
+      "ERROR: PSRAM no detectada"
+    );
+
+    return false;
+  }
+
+  size_t total =
+    ESP.getPsramSize();
+
+  size_t libre =
+    ESP.getFreePsram();
+
+  Serial.println();
+
+  Serial.println(
+    "===== INFORMACION PSRAM ====="
+  );
+
+  Serial.printf(
+    "PSRAM total : %.2f MB\n",
+    total / 1024.0 / 1024.0
+  );
+
+  Serial.printf(
+    "PSRAM libre : %.2f MB\n",
+    libre / 1024.0 / 1024.0
+  );
+
+  Serial.println(
+    "============================="
+  );
+
+  Serial.println(
+    "Reservando buffer HL7..."
+  );
+
+  hl7Buffer =
+    (char*)ps_malloc(
+      BUFFER_SIZE
+    );
+
+  if (hl7Buffer == nullptr) {
+
+    Serial.println(
+      "ERROR: No se pudo reservar buffer HL7"
+    );
+
+    return false;
+  }
+
+  hl7Buffer[0] = '\0';
+
+  Serial.printf(
+    "Buffer HL7 reservado: %lu KB\n",
+    (unsigned long)(
+      BUFFER_SIZE / 1024
+    )
+  );
+
+  Serial.printf(
+    "PSRAM libre despues: %lu KB\n",
+    (unsigned long)(
+      ESP.getFreePsram() / 1024
+    )
+  );
+
+  return true;
+}
+
+// ============================================================
+// SLOTS
+// ============================================================
+
+bool inicializarColaECG() {
+
+  Serial.println();
+
+  Serial.println(
+    "Inicializando slots ECG..."
+  );
+
+  for (
+    int i = 0;
+    i < MAX_ECG_PENDIENTES;
+    i++
+  ) {
+
+    colaECG[i].ocupado =
+      false;
+
+    colaECG[i].enviado =
+      false;
+
+    colaECG[i].paciente[0] =
+      '\0';
+
+    colaECG[i].ecgId[0] =
+      '\0';
+
+    colaECG[i].fecha[0] =
+      '\0';
+
+    Serial.printf(
+      "Reservando slot %d...\n",
+      i + 1
+    );
+
+    colaECG[i].pdfBase64 =
+      (char*)ps_malloc(
+        ECG_SLOT_SIZE
+      );
+
+    if (
+      colaECG[i].pdfBase64 ==
+      nullptr
+    ) {
+
+      Serial.printf(
+        "ERROR: No se pudo reservar slot %d\n",
+        i + 1
+      );
+
+      return false;
+    }
+
+    colaECG[i].pdfBase64[0] =
+      '\0';
+
+    Serial.printf(
+      "Slot %d OK - %lu KB\n",
+      i + 1,
+      (unsigned long)(
+        ECG_SLOT_SIZE / 1024
+      )
+    );
+  }
+
+  totalPendientes =
+    0;
+
+  return true;
+}
+
+// ============================================================
+// BUSCAR SLOT LIBRE
+// ============================================================
+
+int buscarSlotLibre() {
+
+  for (
+    int i = 0;
+    i < MAX_ECG_PENDIENTES;
+    i++
+  ) {
+
+    if (!colaECG[i].ocupado) {
+
+      return i;
+    }
+  }
+
+  return -1;
+}
+
+// ============================================================
+// RECIBIR HL7 MLLP
+// ============================================================
+
+bool recibirHL7PorTCP() {
+
+  EthernetClient cliente =
+    servidorTCP.available();
+
+  if (!cliente) {
+
+    return false;
+  }
+
+  Serial.println();
+
+  Serial.println(
+    "Cliente TCP conectado (Cardioline ECG100+)"
+  );
+
+  memset(
+    hl7Buffer,
+    0,
+    BUFFER_SIZE
+  );
+
+  size_t pos =
+    0;
+
+  unsigned long ultimoDato =
+    millis();
+
+  bool vtRecibido =
+    false;
+
+  bool fsRecibido =
+    false;
+
+  bool bloqueCompleto =
+    false;
+
+  while (
+    cliente.connected() ||
+    cliente.available()
+  ) {
+
+    while (
+      cliente.available()
+    ) {
+
+      char c =
+        cliente.read();
+
+      // ======================================================
+      // VT
+      // ======================================================
+
+      if (!vtRecibido) {
+
+        if (
+          (uint8_t)c ==
+          MLLP_VT
+        ) {
+
+          vtRecibido =
+            true;
+        }
+
+        ultimoDato =
+          millis();
+
+        continue;
+      }
+
+      // ======================================================
+      // FS
+      // ======================================================
+
+      if (
+        (uint8_t)c ==
+        MLLP_FS
+      ) {
+
+        fsRecibido =
+          true;
+
+        ultimoDato =
+          millis();
+
+        continue;
+      }
+
+      // ======================================================
+      // CR DESPUES DE FS
+      // ======================================================
+
+      if (fsRecibido) {
+
+        if (
+          (uint8_t)c ==
+          MLLP_CR
+        ) {
+
+          bloqueCompleto =
+            true;
+
+          break;
+        }
+
+        fsRecibido =
+          false;
+      }
+
+      // ======================================================
+      // GUARDAR CONTENIDO HL7
+      // ======================================================
+
+      if (
+        pos <
+        BUFFER_SIZE - 1
+      ) {
+
+        hl7Buffer[pos++] =
+          c;
+
+      } else {
+
+        Serial.println(
+          "ERROR: Buffer HL7 lleno"
+        );
+
+        cliente.stop();
+
+        return false;
+      }
+
+      ultimoDato =
+        millis();
+    }
+
+    if (bloqueCompleto) {
+      break;
+    }
+
+    if (
+      millis() -
+      ultimoDato >
+      2000
+    ) {
+
+      break;
+    }
+
+    delay(1);
+  }
+
+  if (pos == 0) {
+
+    Serial.println(
+      "Cliente desconectado sin datos"
+    );
+
+    cliente.stop();
+
+    return false;
+  }
+
+  hl7Buffer[pos] =
+    '\0';
+
+  Serial.println();
+
+  Serial.println(
+    "===== TRAMA HL7 RECIBIDA ====="
+  );
+
+  Serial.printf(
+    "VT detectado: %s\n",
+    vtRecibido
+      ? "SI"
+      : "NO"
+  );
+
+  Serial.printf(
+    "FS+CR detectado: %s\n",
+    bloqueCompleto
+      ? "SI"
+      : "NO"
+  );
+
+  Serial.printf(
+    "Tamano: %lu bytes\n",
+    (unsigned long)pos
+  );
+
+  Serial.printf(
+    "Tamano: %.2f KB\n",
+    pos / 1024.0
+  );
+
+  Serial.println(
+    "=============================="
+  );
+
+  // ========================================================
+  // ACK
+  // ========================================================
+
+  enviarACK(cliente);
+
+  cliente.stop();
+
+  return true;
+}
+
+// ============================================================
+// ACK
+// ============================================================
+
+void enviarACK(
+  EthernetClient &cliente
+) {
+
+  String msgControlId =
+    extraerCampoHL7(
+      "MSH",
+      10,
+      1
+    );
+
+  if (
+    msgControlId ==
+    "DESCONOCIDO"
+  ) {
+
+    msgControlId =
+      "0";
+  }
+
+  String ack =
+    "MSH|^~\\&|CARDIOLINK|GATEWAY|ECG100PLUS|CARDIOLINE|00000000000000||ACK^R01^ACK|ACKP|P|2.5\r"
+    "MSA|AA|" +
+    msgControlId +
+    "\r";
+
+  cliente.write(
+    (uint8_t)MLLP_VT
+  );
+
+  cliente.print(
+    ack
+  );
+
+  cliente.write(
+    (uint8_t)MLLP_FS
+  );
+
+  cliente.write(
+    (uint8_t)MLLP_CR
+  );
+
+  cliente.flush();
+
+  Serial.println(
+    "ACK enviado al Cardioline"
+  );
+}
+
+// ============================================================
+// DELIMITADORES
+// ============================================================
+
+bool leerDelimitadores(
+  const char* hl7
+) {
+
+  if (hl7 == nullptr)
+    return false;
+
+  if (
+    strncmp(
+      hl7,
+      "MSH",
+      3
+    ) != 0
+  )
+    return false;
+
+  if (
+    strlen(hl7) < 8
+  )
+    return false;
+
+  delims.campo =
+    hl7[3];
+
+  delims.componente =
+    hl7[4];
+
+  delims.repeticion =
+    hl7[5];
+
+  delims.escape =
+    hl7[6];
+
+  delims.subcomponente =
+    hl7[7];
+
+  Serial.println(
+    "Delimitadores HL7 detectados:"
+  );
+
+  Serial.printf(
+    "  Campo:        '%c'\n",
+    delims.campo
+  );
+
+  Serial.printf(
+    "  Componente:   '%c'\n",
+    delims.componente
+  );
+
+  Serial.printf(
+    "  Repeticion:   '%c'\n",
+    delims.repeticion
+  );
+
+  Serial.printf(
+    "  Escape:       '%c'\n",
+    delims.escape
+  );
+
+  Serial.printf(
+    "  Subcomponente:'%c'\n",
+    delims.subcomponente
+  );
+
+  return true;
+}
+
+// ============================================================
+// EXTRAER COMPONENTE
+// ============================================================
+
+String extraerComponente(
+  const String& campo,
+  int numComponente
+) {
+
+  int actual =
+    1;
+
+  int inicio =
+    0;
+
+  for (
+    int i = 0;
+    i <= (int)campo.length();
+    i++
+  ) {
+
+    if (
+      i == (int)campo.length() ||
+      campo[i] ==
+      delims.componente
+    ) {
+
+      if (
+        actual ==
+        numComponente
+      ) {
+
+        return campo.substring(
+          inicio,
+          i
+        );
+      }
+
+      actual++;
+
+      inicio =
+        i + 1;
+    }
+  }
+
+  return "";
+}
+
+// ============================================================
+// EXTRAER CAMPO SEGMENTO
+//
+// ESTA FUNCION SIGUE SIENDO UTIL PARA CAMPOS PEQUENOS.
+// NO SE UTILIZA PARA EXTRAER EL BASE64.
+// ============================================================
+
+String extraerCampoDeSegmento(
+  const char* segmento,
+  int numCampo
+) {
+
+  int actual =
+    0;
+
+  int len =
+    strlen(segmento);
+
+  int inicio =
+    0;
+
+  for (
+    int i = 0;
+    i <= len;
+    i++
+  ) {
+
+    if (
+      i == len ||
+      segmento[i] ==
+      delims.campo
+    ) {
+
+      if (
+        actual ==
+        numCampo
+      ) {
+
+        char buf[512] = {
+          0
+        };
+
+        int copyLen =
+          i - inicio;
+
+        if (
+          copyLen >
+          511
+        )
+          copyLen =
+            511;
+
+        if (
+          copyLen < 0
+        )
+          copyLen =
+            0;
+
+        strncpy(
+          buf,
+          segmento + inicio,
+          copyLen
+        );
+
+        buf[copyLen] =
+          '\0';
+
+        return String(buf);
+      }
+
+      actual++;
+
+      inicio =
+        i + 1;
+    }
+  }
+
+  return "";
+}
+
+// ============================================================
+// EXTRAER CAMPO HL7
+// ============================================================
+
+String extraerCampoHL7(
+  const char* nombreSegmento,
+  int numCampo,
+  int numComponente
+) {
+
+  char patron[16];
+
+  snprintf(
+    patron,
+    sizeof(patron),
+    "%s%c",
+    nombreSegmento,
+    delims.campo
+  );
+
+  char* inicio =
+    strstr(
+      hl7Buffer,
+      nombreSegmento
+    );
+
+  while (
+    inicio != nullptr
+  ) {
+
+    bool valido =
+      (
+        inicio ==
+        hl7Buffer
+      ) ||
+      (
+        *(inicio - 1) ==
+        '\r'
+      );
+
+    if (
+      valido &&
+      strncmp(
+        inicio,
+        patron,
+        strlen(patron)
+      ) == 0
+    ) {
+
+      break;
+    }
+
+    inicio =
+      strstr(
+        inicio + 1,
+        nombreSegmento
+      );
+  }
+
+  if (
+    inicio ==
+    nullptr
+  ) {
+
+    return "DESCONOCIDO";
+  }
+
+  char* fin =
+    strchr(
+      inicio,
+      '\r'
+    );
+
+  size_t largo =
+    fin != nullptr
+      ? (size_t)(
+          fin - inicio
+        )
+      : strlen(inicio);
+
+  char segTemp[1024] = {
+    0
+  };
+
+  size_t copyLen =
+    largo > 1023
+      ? 1023
+      : largo;
+
+  strncpy(
+    segTemp,
+    inicio,
+    copyLen
+  );
+
+  segTemp[copyLen] =
+    '\0';
+
+  String campo =
+    extraerCampoDeSegmento(
+      segTemp,
+      numCampo
+    );
+
+  if (
+    campo.length() == 0
+  ) {
+
+    return "DESCONOCIDO";
+  }
+
+  if (
+    numComponente <= 1
+  ) {
+
+    return campo;
+  }
+
+  String comp =
+    extraerComponente(
+      campo,
+      numComponente
+    );
+
+  if (
+    comp.length() == 0
+  ) {
+
+    return "DESCONOCIDO";
+  }
+
+  return comp;
+}
+
+// ============================================================
+// COPIAR COMPONENTE DIRECTAMENTE DESDE HL7
+//
+// ESTA ES LA CORRECCION IMPORTANTE.
+//
+// NO UTILIZA String.
+// NO UTILIZA char buf[512].
+// NO CREA UNA COPIA TEMPORAL DEL BASE64.
+//
+// Busca directamente:
+//   campo -> componente -> destino PSRAM
+//
+// De esta forma un Base64 de 500 KB, 800 KB, etc.
+// se copia directamente al slot.
+// ============================================================
+
+bool copiarComponenteDirecto(
+  const char* segmento,
+  int numCampo,
+  int numComponente,
+  char* destino,
+  size_t capacidad,
+  size_t& longitud
+) {
+
+  longitud = 0;
+
+  if (
+    segmento == nullptr ||
+    destino == nullptr ||
+    capacidad == 0
+  ) {
+
+    return false;
+  }
+
+  const char separadorCampo =
+    delims.campo;
+
+  const char separadorComponente =
+    delims.componente;
+
+  int campoActual = 0;
+
+  const char* inicioCampo =
+    segmento;
+
+  const char* p =
+    segmento;
+
+  // ==========================================================
+  // BUSCAR EL CAMPO SOLICITADO
+  // ==========================================================
+
+  while (true) {
+
+    if (
+      *p == separadorCampo ||
+      *p == '\0'
+    ) {
+
+      if (
+        campoActual ==
+        numCampo
+      ) {
+
+        break;
+      }
+
+      if (*p == '\0') {
+
+        return false;
+      }
+
+      campoActual++;
+
+      inicioCampo =
+        p + 1;
+    }
+
+    p++;
+
+    if (*p == '\0') {
+
+      if (
+        campoActual ==
+        numCampo
+      ) {
+
+        break;
+      }
+
+      return false;
+    }
+  }
+
+  const char* finCampo =
+    p;
+
+  // ==========================================================
+  // BUSCAR COMPONENTE
+  // ==========================================================
+
+  int componenteActual =
+    1;
+
+  const char* inicioComponente =
+    inicioCampo;
+
+  const char* q =
+    inicioCampo;
+
+  while (true) {
+
+    if (
+      q == finCampo ||
+      *q == separadorComponente
+    ) {
+
+      if (
+        componenteActual ==
+        numComponente
+      ) {
+
+        const char* finComponente =
+          q;
+
+        size_t largo =
+          (size_t)(
+            finComponente -
+            inicioComponente
+          );
+
+        // ----------------------------------------------------
+        // COMPROBAR CAPACIDAD
+        // ----------------------------------------------------
+
+        if (
+          largo >= capacidad
+        ) {
+
+          Serial.printf(
+            "ERROR: componente demasiado grande: %lu bytes\n",
+            (unsigned long)largo
+          );
+
+          return false;
+        }
+
+        // ----------------------------------------------------
+        // COPIA DIRECTA A PSRAM
+        // ----------------------------------------------------
+
+        memcpy(
+          destino,
+          inicioComponente,
+          largo
+        );
+
+        destino[largo] =
+          '\0';
+
+        longitud =
+          largo;
+
+        return true;
+      }
+
+      if (
+        q == finCampo
+      ) {
+
+        break;
+      }
+
+      componenteActual++;
+
+      inicioComponente =
+        q + 1;
+    }
+
+    q++;
+  }
+
+  return false;
+}
+
+// ============================================================
+// EXTRAER BASE64 PDF DIRECTAMENTE AL SLOT
+//
+// ESTA ES LA VERSION CORREGIDA.
+//
+// IMPORTANTE:
+// - No usa String para el Base64.
+// - No usa buffer de 512 bytes.
+// - No modifica el Base64.
+// - Conserva TODOS los '=' finales.
+// - Copia directamente a PSRAM.
+// ============================================================
+
+bool extraerBase64PDFAlSlot(
+  char* hl7,
+  char* destino,
+  size_t capacidad
+) {
+
+  if (
+    hl7 == nullptr ||
+    destino == nullptr
+  ) {
+
+    return false;
+  }
+
+  destino[0] =
+    '\0';
+
+  char* segmento =
+    hl7;
+
+  int numeroOBX =
+    0;
+
+  while (
+    segmento != nullptr &&
+    *segmento != '\0'
+  ) {
+
+    char* siguiente =
+      strchr(
+        segmento,
+        '\r'
+      );
+
+    if (
+      siguiente != nullptr
+    ) {
+
+      *siguiente =
+        '\0';
+    }
+
+    // ========================================================
+    // VERIFICAR OBX
+    // ========================================================
+
+    char patronOBX[8];
+
+    snprintf(
+      patronOBX,
+      sizeof(patronOBX),
+      "OBX%c",
+      delims.campo
+    );
+
+    if (
+      strncmp(
+        segmento,
+        patronOBX,
+        strlen(patronOBX)
+      ) == 0
+    ) {
+
+      numeroOBX++;
+
+      Serial.printf(
+        "Analizando OBX #%d...\n",
+        numeroOBX
+      );
+
+      // ======================================================
+      // OBX-2
+      // ======================================================
+
+      String tipoValor =
+        extraerCampoDeSegmento(
+          segmento,
+          2
+        );
+
+      Serial.printf(
+        "  OBX-2: %s\n",
+        tipoValor.c_str()
+      );
+
+      if (
+        tipoValor != "ED"
+      ) {
+
+        Serial.println(
+          "  No es ED. Se ignora."
+        );
+
+        if (
+          siguiente == nullptr
+        )
+          break;
+
+        segmento =
+          siguiente + 1;
+
+        continue;
+      }
+
+      // ======================================================
+      // AHORA NO EXTRAEMOS OBX-5 A String
+      //
+      // OBX-5 = campo 5
+      // ED.5  = componente 5
+      //
+      // Se copia directamente al slot PSRAM.
+      // ======================================================
+
+      size_t longitud =
+        0;
+
+      bool encontrado =
+        copiarComponenteDirecto(
+          segmento,
+          5,
+          5,
+          destino,
+          capacidad,
+          longitud
+        );
+
+      if (!encontrado) {
+
+        Serial.println(
+          "  ERROR: No se pudo extraer ED.5"
+        );
+
+        if (
+          siguiente == nullptr
+        )
+          break;
+
+        segmento =
+          siguiente + 1;
+
+        continue;
+      }
+
+      Serial.printf(
+        "  ED.5 Base64: %lu bytes\n",
+        (unsigned long)
+          longitud
+      );
+
+      // ======================================================
+      // VALIDAR QUE HAYA DATOS
+      // ======================================================
+
+      if (
+        longitud == 0
+      ) {
+
+        Serial.println(
+          "  ERROR: ED.5 vacio"
+        );
+
+        destino[0] =
+          '\0';
+
+        if (
+          siguiente == nullptr
+        )
+          break;
+
+        segmento =
+          siguiente + 1;
+
+        continue;
+      }
+
+      // ======================================================
+      // VALIDAR CABECERA PDF
+      // ======================================================
+
+      if (
+        longitud < 6 ||
+        strncmp(
+          destino,
+          "JVBERi",
+          6
+        ) != 0
+      ) {
+
+        Serial.println(
+          "  ERROR: ED.5 no empieza con JVBERi"
+        );
+
+        destino[0] =
+          '\0';
+
+        if (
+          siguiente == nullptr
+        )
+          break;
+
+        segmento =
+          siguiente + 1;
+
+        continue;
+      }
+
+      // ======================================================
+      // DIAGNOSTICO FINAL
+      // ======================================================
+
+      Serial.println();
+
+      Serial.println(
+        "========================================"
+      );
+
+      Serial.println(
+        "PDF ENCONTRADO CORRECTAMENTE"
+      );
+
+      Serial.printf(
+        "OBX numero: %d\n",
+        numeroOBX
+      );
+
+      Serial.printf(
+        "Base64: %lu bytes\n",
+        (unsigned long)
+          longitud
+      );
+
+      Serial.printf(
+        "PDF aproximado: %.2f KB\n",
+        longitud *
+        0.75 /
+        1024.0
+      );
+
+      // ------------------------------------------------------
+      // MOSTRAR LOS ULTIMOS 16 CARACTERES
+      // ------------------------------------------------------
+
+      Serial.print(
+        "Ultimos caracteres Base64: "
+      );
+
+      size_t inicioFinal =
+        longitud > 16
+          ? longitud - 16
+          : 0;
+
+      for (
+        size_t i =
+          inicioFinal;
+        i < longitud;
+        i++
+      ) {
+
+        Serial.print(
+          destino[i]
+        );
+      }
+
+      Serial.println();
+
+      // ------------------------------------------------------
+      // MOSTRAR PADDING
+      // ------------------------------------------------------
+
+      int cantidadIgual =
+        0;
+
+      if (longitud >= 1) {
+
+        if (
+          destino[
+            longitud - 1
+          ] == '='
+        ) {
+
+          cantidadIgual++;
+        }
+      }
+
+      if (longitud >= 2) {
+
+        if (
+          destino[
+            longitud - 2
+          ] == '='
+        ) {
+
+          cantidadIgual++;
+        }
+      }
+
+      Serial.printf(
+        "Cantidad de '=' al final: %d\n",
+        cantidadIgual
+      );
+
+      Serial.printf(
+        "Multiplo de 4: %s\n",
+        (
+          longitud % 4 == 0
+        )
+          ? "SI"
+          : "NO"
+      );
+
+      Serial.printf(
+        "PSRAM libre despues: %lu KB\n",
+        (unsigned long)(
+          ESP.getFreePsram() /
+          1024
+        )
+      );
+
+      Serial.println(
+        "========================================"
+      );
+
+      // ======================================================
+      // IMPORTANTE:
+      //
+      // NO HACEMOS NORMALIZACION.
+      //
+      // Si llegaron:
+      //
+      //     ABC==
+      //
+      // se mantienen:
+      //
+      //     ABC==
+      //
+      // Si llegaron:
+      //
+      //     ABC=
+      //
+      // se mantienen:
+      //
+      //     ABC=
+      //
+      // NO AGREGAMOS NI QUITAMOS '='.
+      // ======================================================
+
+      return true;
+    }
+
+    if (
+      siguiente == nullptr
+    )
+      break;
+
+    segmento =
+      siguiente + 1;
+  }
+
+  Serial.println(
+    "ERROR: No se encontro PDF en ningun OBX ED"
+  );
+
+  return false;
+}
+
+// ============================================================
+// BASE64
+// ============================================================
+
+bool esCaracterBase64(
+  char c
+) {
+
+  return (
+    (c >= 'A' && c <= 'Z') ||
+    (c >= 'a' && c <= 'z') ||
+    (c >= '0' && c <= '9') ||
+    c == '+' ||
+    c == '/' ||
+    c == '='
+  );
+}
+
+// ============================================================
+// VALIDAR BASE64
+//
+// NO MODIFICA EL CONTENIDO.
+// ============================================================
+
+bool validarBase64(
+  const char* base64
+) {
+
+  if (
+    base64 == nullptr
+  )
+    return false;
+
+  size_t len =
+    strlen(base64);
+
+  if (
+    len < 8
+  )
+    return false;
+
+  if (
+    strncmp(
+      base64,
+      "JVBERi",
+      6
+    ) != 0
+  ) {
+
+    return false;
+  }
+
+  if (
+    len % 4 != 0
+  ) {
+
+    Serial.printf(
+      "ERROR: Base64 no es multiplo de 4. Longitud: %lu\n",
+      (unsigned long)len
+    );
+
+    return false;
+  }
+
+  // ==========================================================
+  // VALIDAR CARACTERES
+  // ==========================================================
+
+  for (
+    size_t i = 0;
+    i < len;
+    i++
+  ) {
+
+    if (
+      !esCaracterBase64(
+        base64[i]
+      )
+    ) {
+
+      Serial.printf(
+        "Caracter Base64 invalido en posicion %lu: 0x%02X\n",
+        (unsigned long)i,
+        (unsigned char)
+          base64[i]
+      );
+
+      return false;
+    }
+  }
+
+  // ==========================================================
+  // VALIDAR PADDING
+  // ==========================================================
+
+  int padding = 0;
+
+  if (
+    len >= 1 &&
+    base64[len - 1] == '='
+  ) {
+
+    padding++;
+  }
+
+  if (
+    len >= 2 &&
+    base64[len - 2] == '='
+  ) {
+
+    padding++;
+  }
+
+  // '=' solo puede aparecer al final.
+  if (padding > 0) {
+
+    for (
+      size_t i = 0;
+      i < len - padding;
+      i++
+    ) {
+
+      if (
+        base64[i] == '='
+      ) {
+
+        Serial.printf(
+          "ERROR: '=' encontrado antes del final en posicion %lu\n",
+          (unsigned long)i
+        );
+
+        return false;
+      }
+    }
+  }
+
+  Serial.printf(
+    "Base64 valido. Longitud: %lu. Padding: %d '='\n",
+    (unsigned long)len,
+    padding
+  );
+
+  return true;
+}
+
+// ============================================================
+// LIBERAR SLOT
+// ============================================================
+
+void liberarSlotECG(
+  int index
+) {
+
+  if (
+    index < 0 ||
+    index >=
+    MAX_ECG_PENDIENTES
+  )
+    return;
+
+  colaECG[index].ocupado =
+    false;
+
+  colaECG[index].enviado =
+    false;
+
+  colaECG[index].paciente[0] =
+    '\0';
+
+  colaECG[index].ecgId[0] =
+    '\0';
+
+  colaECG[index].fecha[0] =
+    '\0';
+
+  if (
+    colaECG[index].pdfBase64
+  ) {
+
+    colaECG[index].pdfBase64[0] =
+      '\0';
+  }
+
+  if (
+    totalPendientes > 0
+  )
+    totalPendientes--;
+
+  Serial.printf(
+    "Slot %d liberado\n",
+    index + 1
+  );
+
+  Serial.printf(
+    "Pendientes: %d/%d\n",
+    totalPendientes,
+    MAX_ECG_PENDIENTES
+  );
+}
+
+// ============================================================
+// PROCESAR TRAMA
+// ============================================================
+
+void procesarTrama() {
+
+  Serial.println();
+
+  Serial.println(
+    "Procesando trama HL7 v2.5/2.6..."
+  );
+
+  if (
+    !leerDelimitadores(
+      hl7Buffer
+    )
+  ) {
+
+    Serial.println(
+      "ERROR: MSH invalido"
+    );
+
+    return;
+  }
+
+  // ==========================================================
+  // PACIENTE
+  // ==========================================================
+
+  String apellido =
+    extraerCampoHL7(
+      "PID",
+      5,
+      1
+    );
+
+  String nombre =
+    extraerCampoHL7(
+      "PID",
+      5,
+      2
+    );
+
+  String paciente =
+    apellido +
+    "_" +
+    nombre;
+
+  paciente.replace(
+    "^",
+    "_"
+  );
+
+  paciente.replace(
+    " ",
+    "_"
+  );
+
+  // ==========================================================
+  // OBR
+  // ==========================================================
+
+  String fecha =
+    extraerCampoHL7(
+      "OBR",
+      7,
+      1
+    );
+
+  String ecgId =
+    extraerCampoHL7(
+      "OBR",
+      3,
+      1
+    );
+
+  Serial.printf(
+    "Paciente : %s\n",
+    paciente.c_str()
+  );
+
+  Serial.printf(
+    "ECG ID   : %s\n",
+    ecgId.c_str()
+  );
+
+  Serial.printf(
+    "Fecha    : %s\n",
+    fecha.c_str()
+  );
+
+  // ==========================================================
+  // BUSCAR SLOT
+  // ==========================================================
+
+  int slot =
+    buscarSlotLibre();
+
+  if (
+    slot < 0
+  ) {
+
+    Serial.println();
+
+    Serial.println(
+      "========================================"
+    );
+
+    Serial.println(
+      "NO HAY SLOTS ECG DISPONIBLES"
+    );
+
+    Serial.println(
+      "========================================"
+    );
+
+    mostrarLCD(
+      "MEMORIA LLENA",
+      "2 ECG PENDIENTES",
+      "No hay slots",
+      "libres"
+    );
+
+    delay(3000);
+
+    return;
+  }
+
+  Serial.printf(
+    "Slot disponible: %d\n",
+    slot + 1
+  );
+
+  // ==========================================================
+  // EXTRAER PDF DIRECTAMENTE AL SLOT
+  // ==========================================================
+
+  Serial.println();
+
+  Serial.println(
+    "Buscando PDF dentro de OBX..."
+  );
+
+  bool pdfOK =
+    extraerBase64PDFAlSlot(
+      hl7Buffer,
+      colaECG[slot].pdfBase64,
+      ECG_SLOT_SIZE
+    );
+
+  if (!pdfOK) {
+
+    Serial.println(
+      "ERROR: PDF no encontrado"
+    );
+
+    colaECG[slot].pdfBase64[0] =
+      '\0';
+
+    mostrarLCD(
+      "ERROR",
+      "PDF NO ENCONTRADO",
+      "Revisar OBX ED",
+      "ECG no guardado"
+    );
+
+    delay(3000);
+
+    return;
+  }
+
+  // ==========================================================
+  // VALIDAR BASE64
+  //
+  // IMPORTANTE:
+  // YA NO NORMALIZAMOS.
+  // NO AGREGAMOS "=".
+  // NO ELIMINAMOS "=".
+  // ==========================================================
+
+  if (
+    !validarBase64(
+      colaECG[slot].pdfBase64
+    )
+  ) {
+
+    Serial.println(
+      "ERROR: Base64 invalido"
+    );
+
+    colaECG[slot].pdfBase64[0] =
+      '\0';
+
+    mostrarLCD(
+      "ERROR",
+      "BASE64 INVALIDO",
+      "PDF no procesado",
+      "ECG no guardado"
+    );
+
+    delay(3000);
+
+    return;
+  }
+
+  size_t base64Length =
+    strlen(
+      colaECG[slot].pdfBase64
+    );
+
+  // ==========================================================
+  // DIAGNOSTICO PDF
+  // ==========================================================
+
+  Serial.println();
+
+  Serial.println(
+    "========================================"
+  );
+
+  Serial.println(
+    "DIAGNOSTICO PDF"
+  );
+
+  Serial.printf(
+    "Base64: %lu bytes\n",
+    (unsigned long)
+      base64Length
+  );
+
+  Serial.printf(
+    "PDF aproximado: %.2f KB\n",
+    base64Length *
+    0.75 /
+    1024.0
+  );
+
+  Serial.printf(
+    "Multiplo de 4: %s\n",
+    (
+      base64Length % 4 == 0
+    )
+      ? "SI"
+      : "NO"
+  );
+
+  Serial.printf(
+    "Empieza JVBERi: %s\n",
+    strncmp(
+      colaECG[slot].pdfBase64,
+      "JVBERi",
+      6
+    ) == 0
+      ? "SI"
+      : "NO"
+  );
+
+  // ==========================================================
+  // MOSTRAR FINAL EXACTO
+  // ==========================================================
+
+  Serial.print(
+    "FINAL BASE64 RECIBIDO: "
+  );
+
+  size_t inicioFinal =
+    base64Length > 20
+      ? base64Length - 20
+      : 0;
+
+  for (
+    size_t i =
+      inicioFinal;
+    i < base64Length;
+    i++
+  ) {
+
+    Serial.print(
+      colaECG[slot].pdfBase64[i]
+    );
+  }
+
+  Serial.println();
+
+  int cantidadIgual =
+    0;
+
+  if (
+    base64Length >= 1 &&
+    colaECG[slot].pdfBase64[
+      base64Length - 1
+    ] == '='
+  ) {
+
+    cantidadIgual++;
+  }
+
+  if (
+    base64Length >= 2 &&
+    colaECG[slot].pdfBase64[
+      base64Length - 2
+    ] == '='
+  ) {
+
+    cantidadIgual++;
+  }
+
+  Serial.printf(
+    "Cantidad de '=' al final: %d\n",
+    cantidadIgual
+  );
+
+  Serial.printf(
+    "PSRAM libre: %lu KB\n",
+    (unsigned long)(
+      ESP.getFreePsram() /
+      1024
+    )
+  );
+
+  Serial.println(
+    "========================================"
+  );
+
+  // ==========================================================
+  // COMPLETAR DATOS DEL SLOT
+  // ==========================================================
+
+  strncpy(
+    colaECG[slot].paciente,
+    paciente.c_str(),
+    sizeof(
+      colaECG[slot].paciente
+    ) - 1
+  );
+
+  colaECG[slot].paciente[
+    sizeof(
+      colaECG[slot].paciente
+    ) - 1
+  ] = '\0';
+
+  strncpy(
+    colaECG[slot].ecgId,
+    ecgId.c_str(),
+    sizeof(
+      colaECG[slot].ecgId
+    ) - 1
+  );
+
+  colaECG[slot].ecgId[
+    sizeof(
+      colaECG[slot].ecgId
+    ) - 1
+  ] = '\0';
+
+  strncpy(
+    colaECG[slot].fecha,
+    fecha.c_str(),
+    sizeof(
+      colaECG[slot].fecha
+    ) - 1
+  );
+
+  colaECG[slot].fecha[
+    sizeof(
+      colaECG[slot].fecha
+    ) - 1
+  ] = '\0';
+
+  colaECG[slot].ocupado =
+    true;
+
+  colaECG[slot].enviado =
+    false;
+
+  totalPendientes++;
+
+  huboAlMenosUnECG =
+    true;
+
+  Serial.printf(
+    "ECG guardado en slot %d/%d\n",
+    slot + 1,
+    MAX_ECG_PENDIENTES
+  );
+
+  Serial.printf(
+    "Pendientes: %d/%d\n",
+    totalPendientes,
+    MAX_ECG_PENDIENTES
+  );
+
+  mostrarLCD(
+    "ECG GUARDADO",
+    "PSRAM OK",
+    "Slot " +
+      String(slot + 1),
+    hayInternet
+      ? "Enviando..."
+      : "SIN CONEXION"
+  );
+
+  delay(2000);
+
+  // ==========================================================
+  // ENVIAR FIREBASE
+  // ==========================================================
+
+  gestionarRed();
+
+  if (
+    hayInternet
+  ) {
+
+    enviarECGAFirebase(
+      slot
+    );
+
+    mostrarEstadoListo();
+
+  } else {
+
+    Serial.println(
+      "Sin conexion 4G."
+    );
+
+    Serial.println(
+      "ECG queda almacenado en PSRAM."
+    );
+
+    mostrarLCD(
+      "SIN CONEXION",
+      "ECG guardado OK",
+      "Se enviara cuando",
+      "vuelva 4G"
+    );
+
+    delay(2500);
+  }
+}
+
+// ============================================================
+// COLA PENDIENTES
+// ============================================================
+
+void procesarColaPendientes() {
+
+  if (!hayInternet)
+    return;
+
+  int pendientes =
+    0;
+
+  for (
+    int i = 0;
+    i < MAX_ECG_PENDIENTES;
+    i++
+  ) {
+
+    if (
+      colaECG[i].ocupado &&
+      !colaECG[i].enviado
+    ) {
+
+      pendientes++;
+    }
+  }
+
+  if (
+    pendientes == 0
+  )
+    return;
+
+  Serial.printf(
+    "Hay %d ECG pendientes.\n",
+    pendientes
+  );
+
+  for (
+    int i = 0;
+    i < MAX_ECG_PENDIENTES;
+    i++
+  ) {
+
+    if (
+      colaECG[i].ocupado &&
+      !colaECG[i].enviado
+    ) {
+
+      if (
+        !verificarConexion()
+      ) {
+
+        return;
+      }
+
+      if (
+        !enviarECGAFirebase(i)
+      ) {
+
+        return;
+      }
+
+      delay(500);
+    }
+  }
+}
+
+// ============================================================
+// JSON
+// ============================================================
+
+size_t calcularJSONSize(
+  ECGPendiente& ecg
+) {
+
+  size_t base64Len =
+    strlen(
+      ecg.pdfBase64
+    );
+
+  return
+    base64Len +
+    strlen(ecg.paciente) +
+    strlen(ecg.ecgId) +
+    strlen(ecg.fecha) +
+    300;
+}
+
+// ============================================================
+
+size_t copiarJSONEscapado(
+  char* destino,
+  size_t capacidad,
+  const char* origen
+) {
+
+  size_t pos =
+    0;
+
+  if (
+    destino == nullptr ||
+    origen == nullptr ||
+    capacidad == 0
+  )
+    return 0;
+
+  while (
+    *origen != '\0'
+  ) {
+
+    char c =
+      *origen++;
+
+    if (
+      c == '"' ||
+      c == '\\'
+    ) {
+
+      if (
+        pos + 2 >=
+        capacidad
+      )
+        return 0;
+
+      destino[pos++] =
+        '\\';
+
+      destino[pos++] =
+        c;
+
+    } else {
+
+      if (
+        pos + 1 >=
+        capacidad
+      )
+        return 0;
+
+      destino[pos++] =
+        c;
+    }
+  }
+
+  destino[pos] =
+    '\0';
+
+  return pos;
+}
+
+// ============================================================
+// CONSTRUIR JSON
+// ============================================================
+
+bool construirJSONEnPSRAM(
+  ECGPendiente& ecg,
+  char* json,
+  size_t capacidad,
+  size_t& longitud
+) {
+
+  longitud =
+    0;
+
+  const char* inicio =
+    "{\"fields\":{\"paciente\":{\"stringValue\":\"";
+
+  const char* medio1 =
+    "\"},\"ecg_id\":{\"stringValue\":\"";
+
+  const char* medio2 =
+    "\"},\"fecha\":{\"stringValue\":\"";
+
+  const char* medio3 =
+    "\"},\"pdf_base64\":{\"stringValue\":\"";
+
+  const char* finalJSON =
+    "\"}}}";
+
+  size_t n;
+
+  // ==========================================================
+  // INICIO
+  // ==========================================================
+
+  n =
+    strlen(inicio);
+
+  if (
+    longitud + n >= capacidad
+  )
+    return false;
+
+  memcpy(
+    json + longitud,
+    inicio,
+    n
+  );
+
+  longitud += n;
+
+  // ==========================================================
+  // PACIENTE
+  // ==========================================================
+
+  n =
+    copiarJSONEscapado(
+      json + longitud,
+      capacidad - longitud,
+      ecg.paciente
+    );
+
+  if (
+    n == 0 &&
+    ecg.paciente[0] != '\0'
+  )
+    return false;
+
+  longitud += n;
+
+  // ==========================================================
+  // ECG ID
+  // ==========================================================
+
+  n =
+    strlen(medio1);
+
+  if (
+    longitud + n >= capacidad
+  )
+    return false;
+
+  memcpy(
+    json + longitud,
+    medio1,
+    n
+  );
+
+  longitud += n;
+
+  n =
+    copiarJSONEscapado(
+      json + longitud,
+      capacidad - longitud,
+      ecg.ecgId
+    );
+
+  if (
+    n == 0 &&
+    ecg.ecgId[0] != '\0'
+  )
+    return false;
+
+  longitud += n;
+
+  // ==========================================================
+  // FECHA
+  // ==========================================================
+
+  n =
+    strlen(medio2);
+
+  if (
+    longitud + n >= capacidad
+  )
+    return false;
+
+  memcpy(
+    json + longitud,
+    medio2,
+    n
+  );
+
+  longitud += n;
+
+  n =
+    copiarJSONEscapado(
+      json + longitud,
+      capacidad - longitud,
+      ecg.fecha
+    );
+
+  if (
+    n == 0 &&
+    ecg.fecha[0] != '\0'
+  )
+    return false;
+
+  longitud += n;
+
+  // ==========================================================
+  // PDF BASE64
+  // ==========================================================
+
+  n =
+    strlen(medio3);
+
+  if (
+    longitud + n >= capacidad
+  )
+    return false;
+
+  memcpy(
+    json + longitud,
+    medio3,
+    n
+  );
+
+  longitud += n;
+
+  size_t base64Len =
+    strlen(
+      ecg.pdfBase64
+    );
+
+  if (
+    longitud +
+    base64Len +
+    strlen(finalJSON) +
+    1 >=
+    capacidad
+  ) {
+
+    return false;
+  }
+
+  // ==========================================================
+  // COPIAR BASE64 EXACTAMENTE
+  //
+  // memcpy conserva los '='.
+  // ==========================================================
+
+  memcpy(
+    json + longitud,
+    ecg.pdfBase64,
+    base64Len
+  );
+
+  longitud +=
+    base64Len;
+
+  // ==========================================================
+  // FINAL JSON
+  // ==========================================================
+
+  n =
+    strlen(finalJSON);
+
+  memcpy(
+    json + longitud,
+    finalJSON,
+    n
+  );
+
+  longitud += n;
+
+  json[longitud] =
+    '\0';
+
+  return true;
+}
+
+// ============================================================
+// FIREBASE
+// ============================================================
+
+bool enviarECGAFirebase(
+  int index
+) {
+
+  if (
+    index < 0 ||
+    index >= MAX_ECG_PENDIENTES
+  )
+    return false;
+
+  ECGPendiente& ecg =
+    colaECG[index];
+
+  if (
+    !ecg.ocupado
+  )
+    return false;
+
+  if (
+    !verificarConexion()
+  ) {
+
+    hayInternet =
+      false;
+
+    return false;
+  }
+
+  Serial.println();
+
+  Serial.println(
+    "===== ENVIANDO ECG A FIREBASE ====="
+  );
+
+  Serial.printf(
+    "Slot: %d\n",
+    index + 1
+  );
+
+  Serial.printf(
+    "Paciente: %s\n",
+    ecg.paciente
+  );
+
+  Serial.printf(
+    "ECG ID: %s\n",
+    ecg.ecgId
+  );
+
+  size_t base64Length =
+    strlen(
+      ecg.pdfBase64
+    );
+
+  Serial.printf(
+    "Base64: %lu bytes\n",
+    (unsigned long)
+      base64Length
+  );
+
+  // ==========================================================
+  // DIAGNOSTICO ANTES DEL JSON
+  // ==========================================================
+
+  Serial.print(
+    "FINAL BASE64 ANTES DE JSON: "
+  );
+
+  size_t inicioFinal =
+    base64Length > 20
+      ? base64Length - 20
+      : 0;
+
+  for (
+    size_t i =
+      inicioFinal;
+    i < base64Length;
+    i++
+  ) {
+
+    Serial.print(
+      ecg.pdfBase64[i]
+    );
+  }
+
+  Serial.println();
+
+  int padding =
+    0;
+
+  if (
+    base64Length >= 1 &&
+    ecg.pdfBase64[
+      base64Length - 1
+    ] == '='
+  ) {
+
+    padding++;
+  }
+
+  if (
+    base64Length >= 2 &&
+    ecg.pdfBase64[
+      base64Length - 2
+    ] == '='
+  ) {
+
+    padding++;
+  }
+
+  Serial.printf(
+    "Padding Base64 antes de JSON: %d '='\n",
+    padding
+  );
+
+  // ==========================================================
+  // JSON
+  // ==========================================================
+
+  size_t jsonSize =
+    calcularJSONSize(
+      ecg
+    );
+
+  char* json =
+    (char*)ps_malloc(
+      jsonSize
+    );
+
+  if (
+    json == nullptr
+  ) {
+
+    Serial.println(
+      "ERROR: No se pudo reservar JSON en PSRAM"
+    );
+
+    return false;
+  }
+
+  size_t jsonLength =
+    0;
+
+  if (
+    !construirJSONEnPSRAM(
+      ecg,
+      json,
+      jsonSize,
+      jsonLength
+    )
+  ) {
+
+    Serial.println(
+      "ERROR construyendo JSON"
+    );
+
+    free(json);
+
+    return false;
+  }
+
+  Serial.printf(
+    "JSON: %lu bytes\n",
+    (unsigned long)
+      jsonLength
+  );
+
+  // ==========================================================
+  // VERIFICAR QUE EL JSON CONTENGA EXACTAMENTE EL BASE64
+  // ==========================================================
+
+  const char* marcador =
+    "\"pdf_base64\":{\"stringValue\":\"";
+
+  char* inicioJSONBase64 =
+    strstr(
+      json,
+      marcador
+    );
+
+  if (
+    inicioJSONBase64 != nullptr
+  ) {
+
+    inicioJSONBase64 +=
+      strlen(marcador);
+
+    Serial.print(
+      "FINAL BASE64 EN JSON: "
+    );
+
+    size_t inicioFinalJSON =
+      base64Length > 20
+        ? base64Length - 20
+        : 0;
+
+    for (
+      size_t i =
+        inicioFinalJSON;
+      i < base64Length;
+      i++
+    ) {
+
+      Serial.print(
+        inicioJSONBase64[i]
+      );
+    }
+
+    Serial.println();
+
+    Serial.printf(
+      "Ultimo caracter JSON: '%c'\n",
+      inicioJSONBase64[
+        base64Length - 1
+      ]
+    );
+
+    if (
+      base64Length >= 2
+    ) {
+
+      Serial.printf(
+        "Ultimos 2 JSON: '%c%c'\n",
+        inicioJSONBase64[
+          base64Length - 2
+        ],
+        inicioJSONBase64[
+          base64Length - 1
+        ]
+      );
+    }
+
+  } else {
+
+    Serial.println(
+      "ERROR: No se encontro pdf_base64 dentro del JSON"
+    );
+  }
+
+  // ==========================================================
+  // DOCUMENT ID
+  // ==========================================================
+
+  String docId =
+    String(ecg.paciente) +
+    "_" +
+    String(ecg.ecgId);
+
+  docId.replace(
+    " ",
+    "_"
+  );
+
+  docId.replace(
+    "^",
+    "_"
+  );
+
+  docId.replace(
+    "/",
+    "_"
+  );
+
+  docId.replace(
+    "\\",
+    "_"
+  );
+
+  String path =
+    String(
+      FIREBASE_PATH_BASE
+    ) +
+    "?documentId=" +
+    docId;
+
+  String url =
+    "https://" +
+    String(
+      FIREBASE_HOST
+    ) +
+    path;
+
+  // ==========================================================
+  // HTTPS
+  // ==========================================================
+
+  bool exito =
+    false;
+
+  xSemaphoreTake(
+    modemMutex,
+    portMAX_DELAY
+  );
+
+  if (
+    !modem.https_begin()
+  ) {
+
+    Serial.println(
+      "ERROR: https_begin"
+    );
+
+    free(json);
+
+    xSemaphoreGive(
+      modemMutex
+    );
+
+    return false;
+  }
+
+  if (
+    !modem.https_set_url(
+      url.c_str()
+    )
+  ) {
+
+    Serial.println(
+      "ERROR: URL HTTPS"
+    );
+
+    modem.https_end();
+
+    free(json);
+
+    xSemaphoreGive(
+      modemMutex
+    );
+
+    return false;
+  }
+
+  modem.https_set_content_type(
+    "application/json"
+  );
+
+  Serial.println(
+    "Enviando JSON por HTTPS..."
+  );
+
+  int httpCode =
+    modem.https_post(
+      json,
+      jsonLength
+    );
+
+  free(json);
+
+  Serial.printf(
+    "HTTP Code: %d\n",
+    httpCode
+  );
+
+  String response =
+    modem.https_body();
+
+  Serial.println(
+    response
+  );
+
+  // ==========================================================
+  // RESULTADO
+  // ==========================================================
+
+  if (
+    httpCode == 200 ||
+    httpCode == 201
+  ) {
+
+    Serial.println(
+      "ECG enviado correctamente."
+    );
+
+    exito =
+      true;
+
+    liberarSlotECG(
+      index
+    );
+  }
+
+  else if (
+    httpCode == 409
+  ) {
+
+    Serial.println(
+      "TRAMA YA EXISTE EN FIRESTORE."
+    );
+
+    Serial.println(
+      "Se considera enviada."
+    );
+
+    exito =
+      true;
+
+    liberarSlotECG(
+      index
+    );
+  }
+
+  else {
+
+    Serial.println(
+      "ERROR: Firestore no acepto ECG."
+    );
+  }
+
+  modem.https_end();
+
+  xSemaphoreGive(
+    modemMutex
+  );
+
+  return exito;
+}
