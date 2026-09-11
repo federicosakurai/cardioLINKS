@@ -19,8 +19,8 @@
 #define ETH_MOSI 23
 #define ETH_MISO 19
 #define ETH_SCLK 18
-#define ETH_CS   5
-#define ETH_RST  25
+#define ETH_CS   13
+#define ETH_RST  14
 
 byte macAddress[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
 
