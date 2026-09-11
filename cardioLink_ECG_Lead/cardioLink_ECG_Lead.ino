@@ -139,7 +139,7 @@ struct ECGPendiente {
   char ecgId[64];
   char fecha[64];
 
-  char* pdfBase64;
+  char* leadData;   // antes: pdfBase64. Ahora guarda los valores numericos del ECG lead (OBX tipo NA)
 };
 
 ECGPendiente colaECG[MAX_ECG_PENDIENTES];
@@ -234,8 +234,6 @@ bool inicializarColaECG();
 
 bool recibirHL7PorTCP();
 
-void enviarACK(EthernetClient &cliente);
-
 void procesarTrama();
 
 bool leerDelimitadores(const char* hl7);
@@ -257,7 +255,7 @@ String extraerCampoHL7(
 );
 
 // ============================================================
-// NUEVAS FUNCIONES PARA BASE64
+// EXTRACCION DE DATOS DE ECG LEAD (NA)
 // ============================================================
 
 bool copiarComponenteDirecto(
@@ -269,15 +267,11 @@ bool copiarComponenteDirecto(
   size_t& longitud
 );
 
-bool extraerBase64PDFAlSlot(
+bool extraerLeadECGAlSlot(
   char* hl7,
   char* destino,
   size_t capacidad
 );
-
-bool validarBase64(const char* base64);
-
-bool esCaracterBase64(char c);
 
 // ============================================================
 // ECG
@@ -1860,13 +1854,13 @@ bool inicializarColaECG() {
       i + 1
     );
 
-    colaECG[i].pdfBase64 =
+    colaECG[i].leadData =
       (char*)ps_malloc(
         ECG_SLOT_SIZE
       );
 
     if (
-      colaECG[i].pdfBase64 ==
+      colaECG[i].leadData ==
       nullptr
     ) {
 
@@ -1878,7 +1872,7 @@ bool inicializarColaECG() {
       return false;
     }
 
-    colaECG[i].pdfBase64[0] =
+    colaECG[i].leadData[0] =
       '\0';
 
     Serial.printf(
@@ -1934,7 +1928,7 @@ bool recibirHL7PorTCP() {
   Serial.println();
 
   Serial.println(
-    "Cliente TCP conectado (Cardioline ECG100+)"
+    "Cliente TCP conectado"
   );
 
   memset(
@@ -2121,68 +2115,12 @@ bool recibirHL7PorTCP() {
     "=============================="
   );
 
-  // ========================================================
-  // ACK
-  // ========================================================
-
-  enviarACK(cliente);
+  // NOTA: se elimino el envio de ACK MLLP. No hace falta
+  // responder al equipo emisor tras recibir la trama.
 
   cliente.stop();
 
   return true;
-}
-
-// ============================================================
-// ACK
-// ============================================================
-
-void enviarACK(
-  EthernetClient &cliente
-) {
-
-  String msgControlId =
-    extraerCampoHL7(
-      "MSH",
-      10,
-      1
-    );
-
-  if (
-    msgControlId ==
-    "DESCONOCIDO"
-  ) {
-
-    msgControlId =
-      "0";
-  }
-
-  String ack =
-    "MSH|^~\\&|CARDIOLINK|GATEWAY|ECG100PLUS|CARDIOLINE|00000000000000||ACK^R01^ACK|ACKP|P|2.5\r"
-    "MSA|AA|" +
-    msgControlId +
-    "\r";
-
-  cliente.write(
-    (uint8_t)MLLP_VT
-  );
-
-  cliente.print(
-    ack
-  );
-
-  cliente.write(
-    (uint8_t)MLLP_FS
-  );
-
-  cliente.write(
-    (uint8_t)MLLP_CR
-  );
-
-  cliente.flush();
-
-  Serial.println(
-    "ACK enviado al Cardioline"
-  );
 }
 
 // ============================================================
@@ -2309,7 +2247,7 @@ String extraerComponente(
 // EXTRAER CAMPO SEGMENTO
 //
 // ESTA FUNCION SIGUE SIENDO UTIL PARA CAMPOS PEQUENOS.
-// NO SE UTILIZA PARA EXTRAER EL BASE64.
+// NO SE UTILIZA PARA EXTRAER LOS VALORES DEL LEAD (OBX-5).
 // ============================================================
 
 String extraerCampoDeSegmento(
@@ -2522,17 +2460,10 @@ String extraerCampoHL7(
 // ============================================================
 // COPIAR COMPONENTE DIRECTAMENTE DESDE HL7
 //
-// ESTA ES LA CORRECCION IMPORTANTE.
-//
-// NO UTILIZA String.
-// NO UTILIZA char buf[512].
-// NO CREA UNA COPIA TEMPORAL DEL BASE64.
-//
-// Busca directamente:
-//   campo -> componente -> destino PSRAM
-//
-// De esta forma un Base64 de 500 KB, 800 KB, etc.
-// se copia directamente al slot.
+// Se conserva por si se necesita extraer un componente puntual
+// de un campo grande sin pasar por String. No se usa actualmente
+// para el lead ECG (que copia el campo OBX-5 completo), pero
+// queda disponible para otros usos futuros.
 // ============================================================
 
 bool copiarComponenteDirecto(
@@ -2707,19 +2638,22 @@ bool copiarComponenteDirecto(
 }
 
 // ============================================================
-// EXTRAER BASE64 PDF DIRECTAMENTE AL SLOT
+// EXTRAER DATOS DE ECG LEAD (NA) DIRECTAMENTE AL SLOT
 //
-// ESTA ES LA VERSION CORREGIDA.
+// Busca segmentos OBX tipo "NA" (Numeric Array) que contienen
+// los valores de onda del ECG (ej: Lead II), separados por '^'.
 //
-// IMPORTANTE:
-// - No usa String para el Base64.
-// - No usa buffer de 512 bytes.
-// - No modifica el Base64.
-// - Conserva TODOS los '=' finales.
-// - Copia directamente a PSRAM.
+// A diferencia del PDF Base64 que se manejaba antes:
+// - No se valida cabecera de PDF.
+// - No se valida Base64.
+// - Se copia el campo OBX-5 completo (los valores numericos
+//   separados por '^') tal cual viene, directo a PSRAM.
+// - Si aparece mas de un OBX tipo NA, se van concatenando
+//   separados por ';' con el formato:
+//       LEAD_ID=valor1^valor2^valor3...;LEAD_ID2=...
 // ============================================================
 
-bool extraerBase64PDFAlSlot(
+bool extraerLeadECGAlSlot(
   char* hl7,
   char* destino,
   size_t capacidad
@@ -2736,11 +2670,17 @@ bool extraerBase64PDFAlSlot(
   destino[0] =
     '\0';
 
+  size_t totalEscrito =
+    0;
+
   char* segmento =
     hl7;
 
   int numeroOBX =
     0;
+
+  bool encontradoAlMenosUno =
+    false;
 
   while (
     segmento != nullptr &&
@@ -2790,7 +2730,7 @@ bool extraerBase64PDFAlSlot(
       );
 
       // ======================================================
-      // OBX-2
+      // OBX-2 (tipo de valor)
       // ======================================================
 
       String tipoValor =
@@ -2805,267 +2745,228 @@ bool extraerBase64PDFAlSlot(
       );
 
       if (
-        tipoValor != "ED"
+        tipoValor != "NA"
       ) {
 
         Serial.println(
-          "  No es ED. Se ignora."
+          "  No es NA. Se ignora."
         );
 
         if (
-          siguiente == nullptr
-        )
-          break;
+          siguiente != nullptr
+        ) {
 
-        segmento =
-          siguiente + 1;
+          *siguiente =
+            '\r';
 
-        continue;
+          segmento =
+            siguiente + 1;
+
+          continue;
+        }
+
+        break;
       }
 
       // ======================================================
-      // AHORA NO EXTRAEMOS OBX-5 A String
-      //
-      // OBX-5 = campo 5
-      // ED.5  = componente 5
-      //
-      // Se copia directamente al slot PSRAM.
+      // OBX-3 (identificador del lead, ej: MDC_ECG_LEAD_II)
       // ======================================================
 
-      size_t longitud =
-        0;
-
-      bool encontrado =
-        copiarComponenteDirecto(
+      String idLead =
+        extraerCampoDeSegmento(
           segmento,
-          5,
-          5,
-          destino,
-          capacidad,
-          longitud
+          3
         );
-
-      if (!encontrado) {
-
-        Serial.println(
-          "  ERROR: No se pudo extraer ED.5"
-        );
-
-        if (
-          siguiente == nullptr
-        )
-          break;
-
-        segmento =
-          siguiente + 1;
-
-        continue;
-      }
 
       Serial.printf(
-        "  ED.5 Base64: %lu bytes\n",
-        (unsigned long)
-          longitud
+        "  OBX-3 (Lead): %s\n",
+        idLead.c_str()
       );
 
       // ======================================================
-      // VALIDAR QUE HAYA DATOS
+      // OBX-5 = campo 5, valores numericos separados por '^'
+      //
+      // Se copia el campo COMPLETO (todos los componentes),
+      // directo a PSRAM, sin pasar por String.
       // ======================================================
 
-      if (
-        longitud == 0
-      ) {
+      char* p =
+        segmento;
 
-        Serial.println(
-          "  ERROR: ED.5 vacio"
-        );
-
-        destino[0] =
-          '\0';
-
-        if (
-          siguiente == nullptr
-        )
-          break;
-
-        segmento =
-          siguiente + 1;
-
-        continue;
-      }
-
-      // ======================================================
-      // VALIDAR CABECERA PDF
-      // ======================================================
-
-      if (
-        longitud < 6 ||
-        strncmp(
-          destino,
-          "JVBERi",
-          6
-        ) != 0
-      ) {
-
-        Serial.println(
-          "  ERROR: ED.5 no empieza con JVBERi"
-        );
-
-        destino[0] =
-          '\0';
-
-        if (
-          siguiente == nullptr
-        )
-          break;
-
-        segmento =
-          siguiente + 1;
-
-        continue;
-      }
-
-      // ======================================================
-      // DIAGNOSTICO FINAL
-      // ======================================================
-
-      Serial.println();
-
-      Serial.println(
-        "========================================"
-      );
-
-      Serial.println(
-        "PDF ENCONTRADO CORRECTAMENTE"
-      );
-
-      Serial.printf(
-        "OBX numero: %d\n",
-        numeroOBX
-      );
-
-      Serial.printf(
-        "Base64: %lu bytes\n",
-        (unsigned long)
-          longitud
-      );
-
-      Serial.printf(
-        "PDF aproximado: %.2f KB\n",
-        longitud *
-        0.75 /
-        1024.0
-      );
-
-      // ------------------------------------------------------
-      // MOSTRAR LOS ULTIMOS 16 CARACTERES
-      // ------------------------------------------------------
-
-      Serial.print(
-        "Ultimos caracteres Base64: "
-      );
-
-      size_t inicioFinal =
-        longitud > 16
-          ? longitud - 16
-          : 0;
-
-      for (
-        size_t i =
-          inicioFinal;
-        i < longitud;
-        i++
-      ) {
-
-        Serial.print(
-          destino[i]
-        );
-      }
-
-      Serial.println();
-
-      // ------------------------------------------------------
-      // MOSTRAR PADDING
-      // ------------------------------------------------------
-
-      int cantidadIgual =
+      int campoActual =
         0;
 
-      if (longitud >= 1) {
+      char* inicioCampo =
+        segmento;
+
+      bool encontroCampo5 =
+        false;
+
+      while (
+        *p != '\0'
+      ) {
 
         if (
-          destino[
-            longitud - 1
-          ] == '='
+          *p == delims.campo
         ) {
 
-          cantidadIgual++;
+          campoActual++;
+
+          if (
+            campoActual == 5
+          ) {
+
+            inicioCampo =
+              p + 1;
+
+            encontroCampo5 =
+              true;
+
+            break;
+          }
         }
+
+        p++;
       }
 
-      if (longitud >= 2) {
+      if (
+        !encontroCampo5
+      ) {
+
+        Serial.println(
+          "  ERROR: No se encontro OBX-5"
+        );
 
         if (
-          destino[
-            longitud - 2
-          ] == '='
+          siguiente != nullptr
         ) {
 
-          cantidadIgual++;
+          *siguiente =
+            '\r';
+
+          segmento =
+            siguiente + 1;
+
+          continue;
         }
+
+        break;
       }
 
-      Serial.printf(
-        "Cantidad de '=' al final: %d\n",
-        cantidadIgual
-      );
+      char* finCampo =
+        strchr(
+          inicioCampo,
+          delims.campo
+        );
 
-      Serial.printf(
-        "Multiplo de 4: %s\n",
-        (
-          longitud % 4 == 0
-        )
-          ? "SI"
-          : "NO"
-      );
+      size_t largoValores =
+        finCampo != nullptr
+          ? (size_t)(finCampo - inicioCampo)
+          : strlen(inicioCampo);
 
-      Serial.printf(
-        "PSRAM libre despues: %lu KB\n",
-        (unsigned long)(
-          ESP.getFreePsram() /
-          1024
-        )
-      );
+      if (
+        largoValores == 0
+      ) {
 
-      Serial.println(
-        "========================================"
-      );
+        Serial.println(
+          "  OBX-5 vacio. Se ignora."
+        );
+
+        if (
+          siguiente != nullptr
+        ) {
+
+          *siguiente =
+            '\r';
+
+          segmento =
+            siguiente + 1;
+
+          continue;
+        }
+
+        break;
+      }
 
       // ======================================================
-      // IMPORTANTE:
+      // ARMAR ETIQUETA + VALORES EN EL DESTINO
       //
-      // NO HACEMOS NORMALIZACION.
-      //
-      // Si llegaron:
-      //
-      //     ABC==
-      //
-      // se mantienen:
-      //
-      //     ABC==
-      //
-      // Si llegaron:
-      //
-      //     ABC=
-      //
-      // se mantienen:
-      //
-      //     ABC=
-      //
-      // NO AGREGAMOS NI QUITAMOS '='.
+      // Formato guardado:
+      //   LEAD_ID=valor1^valor2^valor3...;LEAD_ID2=...
       // ======================================================
 
-      return true;
+      size_t espacioNecesario =
+        idLead.length() +
+        1 + // '='
+        largoValores +
+        1;  // posible ';' separador
+
+      if (
+        totalEscrito +
+        espacioNecesario >=
+        capacidad
+      ) {
+
+        Serial.println(
+          "  ERROR: No hay espacio en el slot para este lead"
+        );
+
+        if (
+          siguiente != nullptr
+        ) {
+
+          *siguiente =
+            '\r';
+
+          segmento =
+            siguiente + 1;
+
+          continue;
+        }
+
+        break;
+      }
+
+      if (
+        totalEscrito > 0
+      ) {
+
+        destino[totalEscrito++] =
+          ';';
+      }
+
+      memcpy(
+        destino + totalEscrito,
+        idLead.c_str(),
+        idLead.length()
+      );
+
+      totalEscrito +=
+        idLead.length();
+
+      destino[totalEscrito++] =
+        '=';
+
+      memcpy(
+        destino + totalEscrito,
+        inicioCampo,
+        largoValores
+      );
+
+      totalEscrito +=
+        largoValores;
+
+      destino[totalEscrito] =
+        '\0';
+
+      encontradoAlMenosUno =
+        true;
+
+      Serial.printf(
+        "  Lead '%s' guardado: %lu bytes de valores\n",
+        idLead.c_str(),
+        (unsigned long)largoValores
+      );
     }
 
     if (
@@ -3073,157 +2974,46 @@ bool extraerBase64PDFAlSlot(
     )
       break;
 
+    *siguiente =
+      '\r';
+
     segmento =
       siguiente + 1;
   }
 
-  Serial.println(
-    "ERROR: No se encontro PDF en ningun OBX ED"
-  );
+  if (!encontradoAlMenosUno) {
 
-  return false;
-}
-
-// ============================================================
-// BASE64
-// ============================================================
-
-bool esCaracterBase64(
-  char c
-) {
-
-  return (
-    (c >= 'A' && c <= 'Z') ||
-    (c >= 'a' && c <= 'z') ||
-    (c >= '0' && c <= '9') ||
-    c == '+' ||
-    c == '/' ||
-    c == '='
-  );
-}
-
-// ============================================================
-// VALIDAR BASE64
-//
-// NO MODIFICA EL CONTENIDO.
-// ============================================================
-
-bool validarBase64(
-  const char* base64
-) {
-
-  if (
-    base64 == nullptr
-  )
-    return false;
-
-  size_t len =
-    strlen(base64);
-
-  if (
-    len < 8
-  )
-    return false;
-
-  if (
-    strncmp(
-      base64,
-      "JVBERi",
-      6
-    ) != 0
-  ) {
-
-    return false;
-  }
-
-  if (
-    len % 4 != 0
-  ) {
-
-    Serial.printf(
-      "ERROR: Base64 no es multiplo de 4. Longitud: %lu\n",
-      (unsigned long)len
+    Serial.println(
+      "ERROR: No se encontro ningun OBX tipo NA (lead ECG)"
     );
 
     return false;
   }
 
-  // ==========================================================
-  // VALIDAR CARACTERES
-  // ==========================================================
+  Serial.println();
 
-  for (
-    size_t i = 0;
-    i < len;
-    i++
-  ) {
+  Serial.println(
+    "========================================"
+  );
 
-    if (
-      !esCaracterBase64(
-        base64[i]
-      )
-    ) {
-
-      Serial.printf(
-        "Caracter Base64 invalido en posicion %lu: 0x%02X\n",
-        (unsigned long)i,
-        (unsigned char)
-          base64[i]
-      );
-
-      return false;
-    }
-  }
-
-  // ==========================================================
-  // VALIDAR PADDING
-  // ==========================================================
-
-  int padding = 0;
-
-  if (
-    len >= 1 &&
-    base64[len - 1] == '='
-  ) {
-
-    padding++;
-  }
-
-  if (
-    len >= 2 &&
-    base64[len - 2] == '='
-  ) {
-
-    padding++;
-  }
-
-  // '=' solo puede aparecer al final.
-  if (padding > 0) {
-
-    for (
-      size_t i = 0;
-      i < len - padding;
-      i++
-    ) {
-
-      if (
-        base64[i] == '='
-      ) {
-
-        Serial.printf(
-          "ERROR: '=' encontrado antes del final en posicion %lu\n",
-          (unsigned long)i
-        );
-
-        return false;
-      }
-    }
-  }
+  Serial.println(
+    "DATOS ECG (NA) EXTRAIDOS CORRECTAMENTE"
+  );
 
   Serial.printf(
-    "Base64 valido. Longitud: %lu. Padding: %d '='\n",
-    (unsigned long)len,
-    padding
+    "Total bytes guardados: %lu\n",
+    (unsigned long)totalEscrito
+  );
+
+  Serial.printf(
+    "PSRAM libre despues: %lu KB\n",
+    (unsigned long)(
+      ESP.getFreePsram() / 1024
+    )
+  );
+
+  Serial.println(
+    "========================================"
   );
 
   return true;
@@ -3260,10 +3050,10 @@ void liberarSlotECG(
     '\0';
 
   if (
-    colaECG[index].pdfBase64
+    colaECG[index].leadData
   ) {
 
-    colaECG[index].pdfBase64[0] =
+    colaECG[index].leadData[0] =
       '\0';
   }
 
@@ -3418,35 +3208,35 @@ void procesarTrama() {
   );
 
   // ==========================================================
-  // EXTRAER PDF DIRECTAMENTE AL SLOT
+  // EXTRAER DATOS DE ECG LEAD DIRECTAMENTE AL SLOT
   // ==========================================================
 
   Serial.println();
 
   Serial.println(
-    "Buscando PDF dentro de OBX..."
+    "Buscando datos de ECG Lead dentro de OBX (NA)..."
   );
 
-  bool pdfOK =
-    extraerBase64PDFAlSlot(
+  bool leadOK =
+    extraerLeadECGAlSlot(
       hl7Buffer,
-      colaECG[slot].pdfBase64,
+      colaECG[slot].leadData,
       ECG_SLOT_SIZE
     );
 
-  if (!pdfOK) {
+  if (!leadOK) {
 
     Serial.println(
-      "ERROR: PDF no encontrado"
+      "ERROR: Datos de ECG Lead no encontrados"
     );
 
-    colaECG[slot].pdfBase64[0] =
+    colaECG[slot].leadData[0] =
       '\0';
 
     mostrarLCD(
       "ERROR",
-      "PDF NO ENCONTRADO",
-      "Revisar OBX ED",
+      "LEAD NO ENCONTRADO",
+      "Revisar OBX NA",
       "ECG no guardado"
     );
 
@@ -3455,47 +3245,13 @@ void procesarTrama() {
     return;
   }
 
-  // ==========================================================
-  // VALIDAR BASE64
-  //
-  // IMPORTANTE:
-  // YA NO NORMALIZAMOS.
-  // NO AGREGAMOS "=".
-  // NO ELIMINAMOS "=".
-  // ==========================================================
-
-  if (
-    !validarBase64(
-      colaECG[slot].pdfBase64
-    )
-  ) {
-
-    Serial.println(
-      "ERROR: Base64 invalido"
-    );
-
-    colaECG[slot].pdfBase64[0] =
-      '\0';
-
-    mostrarLCD(
-      "ERROR",
-      "BASE64 INVALIDO",
-      "PDF no procesado",
-      "ECG no guardado"
-    );
-
-    delay(3000);
-
-    return;
-  }
-
-  size_t base64Length =
+  size_t leadDataLength =
     strlen(
-      colaECG[slot].pdfBase64
+      colaECG[slot].leadData
     );
 
   // ==========================================================
-  // DIAGNOSTICO PDF
+  // DIAGNOSTICO DATOS ECG LEAD
   // ==========================================================
 
   Serial.println();
@@ -3505,95 +3261,13 @@ void procesarTrama() {
   );
 
   Serial.println(
-    "DIAGNOSTICO PDF"
+    "DIAGNOSTICO DATOS ECG LEAD"
   );
 
   Serial.printf(
-    "Base64: %lu bytes\n",
+    "Tamano: %lu bytes\n",
     (unsigned long)
-      base64Length
-  );
-
-  Serial.printf(
-    "PDF aproximado: %.2f KB\n",
-    base64Length *
-    0.75 /
-    1024.0
-  );
-
-  Serial.printf(
-    "Multiplo de 4: %s\n",
-    (
-      base64Length % 4 == 0
-    )
-      ? "SI"
-      : "NO"
-  );
-
-  Serial.printf(
-    "Empieza JVBERi: %s\n",
-    strncmp(
-      colaECG[slot].pdfBase64,
-      "JVBERi",
-      6
-    ) == 0
-      ? "SI"
-      : "NO"
-  );
-
-  // ==========================================================
-  // MOSTRAR FINAL EXACTO
-  // ==========================================================
-
-  Serial.print(
-    "FINAL BASE64 RECIBIDO: "
-  );
-
-  size_t inicioFinal =
-    base64Length > 20
-      ? base64Length - 20
-      : 0;
-
-  for (
-    size_t i =
-      inicioFinal;
-    i < base64Length;
-    i++
-  ) {
-
-    Serial.print(
-      colaECG[slot].pdfBase64[i]
-    );
-  }
-
-  Serial.println();
-
-  int cantidadIgual =
-    0;
-
-  if (
-    base64Length >= 1 &&
-    colaECG[slot].pdfBase64[
-      base64Length - 1
-    ] == '='
-  ) {
-
-    cantidadIgual++;
-  }
-
-  if (
-    base64Length >= 2 &&
-    colaECG[slot].pdfBase64[
-      base64Length - 2
-    ] == '='
-  ) {
-
-    cantidadIgual++;
-  }
-
-  Serial.printf(
-    "Cantidad de '=' al final: %d\n",
-    cantidadIgual
+      leadDataLength
   );
 
   Serial.printf(
@@ -3801,13 +3475,13 @@ size_t calcularJSONSize(
   ECGPendiente& ecg
 ) {
 
-  size_t base64Len =
+  size_t leadLen =
     strlen(
-      ecg.pdfBase64
+      ecg.leadData
     );
 
   return
-    base64Len +
+    leadLen +
     strlen(ecg.paciente) +
     strlen(ecg.ecgId) +
     strlen(ecg.fecha) +
@@ -3899,7 +3573,7 @@ bool construirJSONEnPSRAM(
     "\"},\"fecha\":{\"stringValue\":\"";
 
   const char* medio3 =
-    "\"},\"pdf_base64\":{\"stringValue\":\"";
+    "\"},\"ecg_lead_data\":{\"stringValue\":\"";
 
   const char* finalJSON =
     "\"}}}";
@@ -4016,7 +3690,7 @@ bool construirJSONEnPSRAM(
   longitud += n;
 
   // ==========================================================
-  // PDF BASE64
+  // DATOS ECG LEAD
   // ==========================================================
 
   n =
@@ -4035,14 +3709,14 @@ bool construirJSONEnPSRAM(
 
   longitud += n;
 
-  size_t base64Len =
+  size_t leadLen =
     strlen(
-      ecg.pdfBase64
+      ecg.leadData
     );
 
   if (
     longitud +
-    base64Len +
+    leadLen +
     strlen(finalJSON) +
     1 >=
     capacidad
@@ -4052,19 +3726,17 @@ bool construirJSONEnPSRAM(
   }
 
   // ==========================================================
-  // COPIAR BASE64 EXACTAMENTE
-  //
-  // memcpy conserva los '='.
+  // COPIAR DATOS DE LEAD EXACTAMENTE (memcpy conserva todo)
   // ==========================================================
 
   memcpy(
     json + longitud,
-    ecg.pdfBase64,
-    base64Len
+    ecg.leadData,
+    leadLen
   );
 
   longitud +=
-    base64Len;
+    leadLen;
 
   // ==========================================================
   // FINAL JSON
@@ -4140,70 +3812,15 @@ bool enviarECGAFirebase(
     ecg.ecgId
   );
 
-  size_t base64Length =
+  size_t leadDataLength =
     strlen(
-      ecg.pdfBase64
+      ecg.leadData
     );
 
   Serial.printf(
-    "Base64: %lu bytes\n",
+    "Datos ECG Lead: %lu bytes\n",
     (unsigned long)
-      base64Length
-  );
-
-  // ==========================================================
-  // DIAGNOSTICO ANTES DEL JSON
-  // ==========================================================
-
-  Serial.print(
-    "FINAL BASE64 ANTES DE JSON: "
-  );
-
-  size_t inicioFinal =
-    base64Length > 20
-      ? base64Length - 20
-      : 0;
-
-  for (
-    size_t i =
-      inicioFinal;
-    i < base64Length;
-    i++
-  ) {
-
-    Serial.print(
-      ecg.pdfBase64[i]
-    );
-  }
-
-  Serial.println();
-
-  int padding =
-    0;
-
-  if (
-    base64Length >= 1 &&
-    ecg.pdfBase64[
-      base64Length - 1
-    ] == '='
-  ) {
-
-    padding++;
-  }
-
-  if (
-    base64Length >= 2 &&
-    ecg.pdfBase64[
-      base64Length - 2
-    ] == '='
-  ) {
-
-    padding++;
-  }
-
-  Serial.printf(
-    "Padding Base64 antes de JSON: %d '='\n",
-    padding
+      leadDataLength
   );
 
   // ==========================================================
@@ -4257,78 +3874,6 @@ bool enviarECGAFirebase(
     (unsigned long)
       jsonLength
   );
-
-  // ==========================================================
-  // VERIFICAR QUE EL JSON CONTENGA EXACTAMENTE EL BASE64
-  // ==========================================================
-
-  const char* marcador =
-    "\"pdf_base64\":{\"stringValue\":\"";
-
-  char* inicioJSONBase64 =
-    strstr(
-      json,
-      marcador
-    );
-
-  if (
-    inicioJSONBase64 != nullptr
-  ) {
-
-    inicioJSONBase64 +=
-      strlen(marcador);
-
-    Serial.print(
-      "FINAL BASE64 EN JSON: "
-    );
-
-    size_t inicioFinalJSON =
-      base64Length > 20
-        ? base64Length - 20
-        : 0;
-
-    for (
-      size_t i =
-        inicioFinalJSON;
-      i < base64Length;
-      i++
-    ) {
-
-      Serial.print(
-        inicioJSONBase64[i]
-      );
-    }
-
-    Serial.println();
-
-    Serial.printf(
-      "Ultimo caracter JSON: '%c'\n",
-      inicioJSONBase64[
-        base64Length - 1
-      ]
-    );
-
-    if (
-      base64Length >= 2
-    ) {
-
-      Serial.printf(
-        "Ultimos 2 JSON: '%c%c'\n",
-        inicioJSONBase64[
-          base64Length - 2
-        ],
-        inicioJSONBase64[
-          base64Length - 1
-        ]
-      );
-    }
-
-  } else {
-
-    Serial.println(
-      "ERROR: No se encontro pdf_base64 dentro del JSON"
-    );
-  }
 
   // ==========================================================
   // DOCUMENT ID
